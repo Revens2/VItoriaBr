@@ -721,6 +721,27 @@ fn create() -> windows::core::Result<Host> {
             tracing::info!(min = o1.WaveLaneCountMin, max = o1.WaveLaneCountMax, "host wave lanes");
             victory_shader::emit::set_host_max_wave(o1.WaveLaneCountMax);
         }
+        // `VICTORY_D3D12_GBV=unguarded`: shaders patched to report bad
+        // accesses without guarding them, much lighter than the default
+        // (guarded) patching, under which the title breaks before the world.
+        if debug
+            && std::env::var("VICTORY_D3D12_GBV").is_ok_and(|v| v == "unguarded")
+            && let Ok(d) = device.cast::<ID3D12DebugDevice1>()
+        {
+            let settings = D3D12_DEBUG_DEVICE_GPU_BASED_VALIDATION_SETTINGS {
+                MaxMessagesPerCommandList: 64,
+                DefaultShaderPatchMode:
+                    D3D12_GPU_BASED_VALIDATION_SHADER_PATCH_MODE_UNGUARDED_VALIDATION,
+                PipelineStateCreateFlags:
+                    D3D12_GPU_BASED_VALIDATION_PIPELINE_STATE_CREATE_FLAG_NONE,
+            };
+            let set = d.SetDebugParameter(
+                D3D12_DEBUG_DEVICE_PARAMETER_GPU_BASED_VALIDATION_SETTINGS,
+                std::ptr::from_ref(&settings).cast(),
+                std::mem::size_of_val(&settings) as u32,
+            );
+            tracing::info!(ok = set.is_ok(), "GPU-based validation unguarded");
+        }
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
