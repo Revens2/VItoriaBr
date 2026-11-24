@@ -58,6 +58,8 @@ mod shadow;
 mod tiles;
 pub mod signature;
 #[cfg(windows)]
+mod tdr;
+#[cfg(windows)]
 mod texture;
 #[cfg(windows)]
 mod watch;
