@@ -2491,4 +2491,60 @@ fn packed_dot_products_and_clamps_execute_cleanly() {
             assert_eq!(got, 32, "{backend}: v_dot2_u32_u16 opsel got {got}, want 32");
         },
     );
+
+    // v_dot2_f32_f16 with negated accumulator (v.neg[2]=1) and negated low src0 (v.neg[0]=1, v.neg[2]=1).
+    for (words, want) in [
+        ([0xCC13_4000u32, 0x9C0E_0501u32], 2.0f32.to_bits()),
+        ([0xCC13_4000u32, 0xBC0E_0501u32], (-4.0f32).to_bits()),
+    ] {
+        let shader = build_valu_cs(&words);
+        run_cases(
+            &shader,
+            &[[0x4000_3C00u32, 0x4400_4200u32, 9.0f32.to_bits(), 0]],
+            |backend, _i, _inp, got| {
+                assert_eq!(got, want, "{backend}: v_dot2_f32_f16 neg {words:08x?} got {got:#x}, want {want:#x}");
+            },
+        );
+    }
+
+    // v_dot2_f32_f16 exact f16 denormals through legacyF16ToF32.
+    let denorm_in = [
+        [0x03FF_0001u32, 0x3C00_3C00u32, 0.0f32.to_bits(), 0],
+        [0x0001_0001u32, 0xBC00_3C00u32, 0x3380_0000u32, 0],
+    ];
+    run_cases(&dot2_f16_shader, &denorm_in, |backend, i, _inp, got| {
+        let want = if i == 0 {
+            (1024.0f32 * 2.0f32.powi(-24)).to_bits()
+        } else {
+            0x3380_0000u32
+        };
+        assert_eq!(got, want, "{backend}: v_dot2_f32_f16 denorm case {i} got {got:#x}, want {want:#x}");
+    });
+
+    // Constant multiplicand cases across dot4 forms (guards against Arc IGC 16-bit constant miscompilation).
+    let [d4i_w0, d4i_w1] = vop3p(0x016, 0, vgpr(1), vgpr(2), vgpr(3));
+    let [d4u_w0, d4u_w1] = vop3p(0x017, 0, vgpr(1), vgpr(2), vgpr(3));
+    let const_dot4_cases: &[(&[u32], [u32; 4], u32)] = &[
+        (
+            &[vop1(0x001, 2, 0xFF), 0x0000_8000, d4i_w0, d4i_w1],
+            [0x0403_0201u32, 0, 10u32, 0],
+            (10i32 + 2i32 * (-128i32)) as u32,
+        ),
+        (
+            &[vop1(0x001, 2, 0xFF), 0xFFFF_8000, d4u_w0, d4u_w1],
+            [0x0403_0201u32, 0, 10u32, 0],
+            10 + 4 * 0xFF + 3 * 0xFF + 2 * 0x80,
+        ),
+        (
+            &[vop1(0x001, 2, 0xFF), 0x0000_4000, vop1(0x001, 0, vgpr(3)), 0x0D << 25 | 2 << 9 | vgpr(1) as u32],
+            [0x0403_0201u32, 0, 10u32, 0],
+            10 + 2 * 0x40,
+        ),
+    ];
+    for &(body, inp, want) in const_dot4_cases {
+        let shader = build_valu_cs(body);
+        run_cases(&shader, &[inp], |backend, _i, _inp, got| {
+            assert_eq!(got, want, "{backend}: const dot4 {body:08x?} got {got:#x}, want {want:#x}");
+        });
+    }
 }
