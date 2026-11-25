@@ -4827,7 +4827,7 @@ mod card_merge_tests {
                 dirty: Mutex::default(),
                 sent: Mutex::new(vec![(title_byte, title_byte + 1, 7)]),
                 queued: std::sync::atomic::AtomicBool::new(false),
-                masked: Mutex::new(Masked::default()),
+                masked: Mutex::new(super::Masked::default()),
                 // 0: no card bytes counted (`Drop` takes them off again).
                 size: 0,
             });
