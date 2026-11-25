@@ -1933,6 +1933,41 @@ void main(uint3 id : SV_DispatchThreadID) {
 }
 "#;
 
+/// [`CARD_COMPARE`], with its loop loading eight places a step before the
+/// hashes take them when `VICTORY_CARD_COMPARE_X8=1` (off by default): the
+/// same hashes, in the same order. After AvatarManz `9b90ad1`
+/// (avatarmanz/VIctory-7900XTX, GPL-3.0; 1.93 -> 1.69 ms a frame on their
+/// capture), adapted to the one thread per piece compare.
+fn card_compare_source() -> String {
+    const LOOP: &str = "    for (uint at = lo; at < hi; at += 16u) {
+";
+    if !std::env::var_os("VICTORY_CARD_COMPARE_X8").is_some_and(|v| v == "1") {
+        return CARD_COMPARE.to_string();
+    }
+    let step = "        h = (h ^ v) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+        h = h.yzwx ^ (h >> 15);
+";
+    let mut wide = String::from("    uint at = lo;
+    [loop]
+    for (; at + 112u < hi; at += 128u) {
+");
+    for i in 0..8 {
+        wide.push_str(&format!("        uint4 v{i} = now.Load4(at + {}u);
+", i * 16));
+    }
+    for i in 0..8 {
+        wide.push_str(&step.replace("(h ^ v)", &format!("(h ^ v{i})")));
+    }
+    wide.push_str("    }
+    [loop]
+    for (; at < hi; at += 16u) {
+");
+    let source = CARD_COMPARE.replacen(&format!("    [loop]
+{LOOP}"), &wide, 1);
+    debug_assert!(source != CARD_COMPARE, "the card compare's loop was not found");
+    source
+}
+
 /// Whether the pieces a flight's compare flags come down to the PC inside
 /// the flight itself (`VICTORY_CARD_FETCH_INFLIGHT=1`; off by default, and
 /// only with [`relay`]).
@@ -4331,12 +4366,13 @@ impl Host {
         use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
         use windows::Win32::Graphics::Direct3D::ID3DBlob;
         let mut code: Option<ID3DBlob> = None;
+        let compare_source = card_compare_source();
         // SAFETY: the source and names live through the call; the out
         // pointer is ours.
         unsafe {
             D3DCompile(
-                CARD_COMPARE.as_ptr().cast(),
-                CARD_COMPARE.len(),
+                compare_source.as_ptr().cast(),
+                compare_source.len(),
                 windows::core::s!("card compare"),
                 None,
                 None,
