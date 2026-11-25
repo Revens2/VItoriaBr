@@ -7631,6 +7631,17 @@ impl<'a> Lower<'a> {
                 let r = self.s.m.cast(c, op, a, self.s.t.f32);
                 float(self, r)
             }
+            "v_cvt_off_f32_i4" => {
+                // RDNA2 ISA: S0[3:0] as a signed nibble, over 16 (-0.5 for
+                // 1000 to 0.4375 for 0111), exactly.
+                let a = s(self, 0)?;
+                let (k28, sixteenth) = (self.s.m.i32(28), self.s.m.f32(0.0625f32.to_bits()));
+                let n = self.s.m.bin(c, Bin::Shl, a, k28);
+                let n = self.s.m.bin(c, Bin::AShr, n, k28);
+                let f = self.s.m.cast(c, Cast::SiToFp, n, self.s.t.f32);
+                let r = self.s.m.bin(c, Bin::Mul, f, sixteenth);
+                float(self, r)
+            }
             "v_cvt_f32_f64" => {
                 let (lo, hi) = self.f64_pair(inst, 0)?;
                 let bits = self.f64_to_f32_bits(lo, hi);
