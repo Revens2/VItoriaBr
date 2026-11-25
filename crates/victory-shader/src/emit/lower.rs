@@ -8288,6 +8288,8 @@ impl<'a> Lower<'a> {
             "v_ashrrev_i16",
             "v_max_u16",
             "v_max_i16",
+            "v_mad_u16",
+            "v_mad_i16",
             "v_min_u16",
             "v_min_i16",
             "v_cvt_u16_f16",
@@ -8472,6 +8474,41 @@ impl<'a> Lower<'a> {
             let nan = self.s.m.cmp(c, pred::UNO, a, a);
             let z = self.s.m.i32(0);
             let r = self.s.m.select(c, nan, z, r);
+            return self.write_half(inst, r, guard);
+        }
+        if matches!(name, "v_mad_u16" | "v_mad_i16") {
+            // RDNA2 ISA: D.u16 = S0.u16 * S1.u16 + S2.u16 (D.i16 from
+            // sign-extended halves), saturating to the 16-bit range with
+            // clamp. The exact sum fits in 32 bits either way: at most
+            // 0xFFFE_0001 + 0xFFFF unsigned, within +-2^30 + 2^15 signed.
+            if v.omod != 0 || v.abs != 0 || v.neg != 0 {
+                return Err("modifiers on a 16-bit integer operation");
+            }
+            let signed = name == "v_mad_i16";
+            let k16 = self.s.m.i32(16);
+            let (a, b) = (self.half_src(inst, 0)?, self.half_src(inst, 1)?);
+            let mut x = [a, b, self.half_src(inst, 2)?];
+            if signed {
+                for x in &mut x {
+                    let t = self.s.m.bin(c, Bin::Shl, *x, k16);
+                    *x = self.s.m.bin(c, Bin::AShr, t, k16);
+                }
+            }
+            let p = self.s.m.bin(c, Bin::Mul, x[0], x[1]);
+            let mut r = self.s.m.bin(c, Bin::Add, p, x[2]);
+            if v.clamp {
+                let clip = |l: &mut Self, r: V, p, limit: u32| {
+                    let k = l.s.m.i32(limit);
+                    let out = l.s.m.cmp(c, p, r, k);
+                    l.s.m.select(c, out, k, r)
+                };
+                r = if signed {
+                    let r = clip(self, r, pred::SLT, 0xFFFF_8000);
+                    clip(self, r, pred::SGT, 0x7FFF)
+                } else {
+                    clip(self, r, pred::IUGT, 0xFFFF)
+                };
+            }
             return self.write_half(inst, r, guard);
         }
         if matches!(name, "v_cvt_norm_i16_f16" | "v_cvt_norm_u16_f16") {
@@ -8961,6 +8998,22 @@ impl<'a> Lower<'a> {
                     .s
                     .op(c, "unaryBits.i32", Attr::ReadNone, self.s.t.i32, 31, &[a]);
                 self.s.m.bin(c, Bin::Add, n, b)
+            }
+            "v_mad_u32_u16" | "v_mad_i32_i16" => {
+                // RDNA2 ISA: D.u32 = S0.u16 * S1.u16 + S2.u32 (D.i32 from
+                // sign-extended halves); op_sel picks the halves of src0
+                // and src1. The 32-bit sum wraps.
+                let (mut a, mut b) = (self.half_src(inst, 0)?, self.half_src(inst, 1)?);
+                let d = s(self, 2)?;
+                if name == "v_mad_i32_i16" {
+                    let k16 = k(self, 16);
+                    let t = self.s.m.bin(c, Bin::Shl, a, k16);
+                    a = self.s.m.bin(c, Bin::AShr, t, k16);
+                    let t = self.s.m.bin(c, Bin::Shl, b, k16);
+                    b = self.s.m.bin(c, Bin::AShr, t, k16);
+                }
+                let m = self.s.m.bin(c, Bin::Mul, a, b);
+                self.s.m.bin(c, Bin::Add, m, d)
             }
             "v_mad_u32_u24" | "v_mad_i32_i24" => {
                 let (a, b, d) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
