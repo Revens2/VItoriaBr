@@ -230,7 +230,7 @@ fn run_cases_on(
     let mut ran = 0;
     for &(label, warp) in devices {
         let Ok(host) = Host::new(warp) else {
-            eprintln!("no SM 6.6 {label} device; skipped");
+            crate::emit::test_skip::skip(&format!("no SM 6.6 {label} device; skipped"));
             continue;
         };
         let (root, pso) = host
@@ -1622,13 +1622,14 @@ fn whole_wave_f64_sum_and_cvt_f32_f64() {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     for (label, warp) in [("hardware", false), ("warp", true)] {
         let Ok(host) = Host::new(warp) else {
+            crate::emit::test_skip::skip(&format!("no SM 6.6 {label} device"));
             continue;
         };
         let (root, pso) = match host.compute_pipeline(&shader) {
             Ok(p) => p,
             // WARP does not support fixed WaveSize(32) on SM 6.6.
             Err(e) if warp => {
-                eprintln!("{label}: compute_pipeline skipped ({e})");
+                crate::emit::test_skip::skip(&format!("{label}: compute_pipeline refused ({e})"));
                 continue;
             }
             Err(e) => panic!("{label}: compute_pipeline failed: {e}"),
