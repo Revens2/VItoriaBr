@@ -1396,7 +1396,8 @@ unsafe fn copy_wide(src: *const u8, dst: *mut u8, len: usize) {
 
 /// Whether the snapshots of a submission's shader-written ranges, and the
 /// compare that finds what the shaders wrote, run on several threads
-/// across ranges (`VICTORY_WIDE_BACK=1`; off by default).
+/// across ranges (on by default; `VICTORY_WIDE_BACK=0` takes and compares
+/// them range by range, as before).
 ///
 /// Both ran range by range on the submitting thread, a range on several
 /// threads only if it was 16 MiB or more. The ranges left on the CPU's side
@@ -1415,6 +1416,12 @@ unsafe fn copy_wide(src: *const u8, dst: *mut u8, len: usize) {
 /// preparing (a declared range is left alone by every refresh, the title's
 /// own copies write title memory and not the copy, and the card runs the
 /// lists only afterwards).
+///
+/// A noted snapshot points into the copy's snapshot memory, which stays
+/// until every range of the copy is done with (`copy_back_done`): the range
+/// just declared is one, and its copy-back comes after the submission is
+/// sent. With the relay an earlier flight may land meanwhile; its merge
+/// touches only its own declared ranges, which a noted part never holds.
 pub(crate) fn wide_back() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     // On by default; `VICTORY_WIDE_BACK=0` turns it off.

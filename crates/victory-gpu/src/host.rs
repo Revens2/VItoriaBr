@@ -2052,8 +2052,8 @@ void main(uint3 group : SV_GroupID, uint t : SV_GroupIndex) {
 
 /// Whether the pieces hashed again after ranges were sent up to a copy in
 /// the card's memory are hashed in runs of pieces that touch, each piece
-/// once (`VICTORY_CARD_REHASH_RUNS=1`; off by default), and not in a pass
-/// per range sent up.
+/// once (on by default; `VICTORY_CARD_REHASH_RUNS=0` makes a pass per
+/// range sent up, as before).
 ///
 /// These passes are ours, they run on the card before every submission's
 /// lists, and no timing so far names them: each walks its 64 KiB pieces
@@ -2061,8 +2061,13 @@ void main(uint3 group : SV_GroupID, uint t : SV_GroupIndex) {
 /// the time of one piece however few its pieces are. Run 102 sent up 514
 /// ranges a frame: 514 such passes. The same pieces are hashed either way;
 /// a piece hashed when it need not be, or not hashed when it should, costs
-/// a fetch that finds nothing and loses no shader write.
+/// a fetch that finds nothing and loses no shader write. The hash pass
+/// hashes whole pieces whatever range named them (the shader takes only
+/// the run's first piece and count), so a run of joined pieces stores the
+/// hashes the passes per range stored, each once
+/// (`crate::shadow::joined_piece_runs`).
 ///
+/// On by default (FernandoHaeser/ztrx perf/30fps 78eeea2; `=0` as before).
 /// `VICTORY_CARD_REHASH_RUNS=alt`: twenty seconds with, twenty without, in
 /// turn, each change said in the log: one run then measures both on the
 /// same scene (the card meter's "send-and-hash lists" in the frame log).
@@ -2072,9 +2077,9 @@ fn rehash_runs() -> bool {
     /// 0 off, 1 on, 2 in turn.
     static MODE: OnceLock<u8> = OnceLock::new();
     match *MODE.get_or_init(|| match std::env::var("VICTORY_CARD_REHASH_RUNS").as_deref() {
-        Ok("1") => 1,
+        Ok("0") => 0,
         Ok("alt") => 2,
-        _ => 0,
+        _ => 1,
     }) {
         0 => false,
         1 => true,
@@ -7557,7 +7562,8 @@ impl HostList {
 }
 
 /// Whether a submission's refreshes of host copies run on several threads,
-/// a copy to a thread (`VICTORY_WIDE_REFRESH=1`; off by default).
+/// a copy to a thread (on by default; `VICTORY_WIDE_REFRESH=0` refreshes
+/// them one after the other on the submitting thread, as before).
 ///
 /// A submission brings some sixty copies up to date, one after the other
 /// on the submitting thread: for each, the pages the title wrote are asked
@@ -7567,10 +7573,14 @@ impl HostList {
 /// title memory. With the switch the copies of a flush (four or more) are
 /// spread over the threads kept for the snapshots (`crate::shadow::wide`).
 /// The write-watch journal and the guards are behind their own locks, as
-/// they are for the title's threads.
+/// they are for the title's threads; a copy's own notes (which pages it
+/// took, what goes up to its card side) are its own. Two copies of the
+/// same title memory each read it and write only themselves, and the
+/// journal tells both of a page either asking found written, in whichever
+/// order they ask. A flush holds each copy once (`Batch::add`).
 fn wide_refresh() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_REFRESH").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_REFRESH").is_none_or(|v| v != "0"))
 }
 
 /// Whether a range of a host copy brought up to date in a submission is
@@ -8511,7 +8521,7 @@ impl Meter {
             if passes + compares > 0.0 {
                 tracing::info!(
                     "our passes over copies in the card's memory per frame: {passes:.0} hash passes over {pieces:.0} pieces after \
-                     ranges were sent up (VICTORY_CARD_REHASH_RUNS=1 joins them: now {}), {compares:.0} compare passes",
+                     ranges were sent up (VICTORY_CARD_REHASH_RUNS=0 makes one per range: joined now {}), {compares:.0} compare passes",
                     if rehash_runs() { "on" } else { "off" }
                 );
             }
