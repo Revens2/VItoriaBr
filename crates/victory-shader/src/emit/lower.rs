@@ -7003,6 +7003,40 @@ impl<'a> Lower<'a> {
             return self.dot_product(inst, name, guard);
         }
         match name {
+            "v_add_nc_i32" | "v_sub_nc_i32" => {
+                // RDNA2 ISA: D.i = S0.i +/- S1.i; with clamp the result
+                // saturates to the signed 32-bit range (LLVM selects these
+                // for llvm.sadd.sat/ssub.sat). Without clamp they are the
+                // unsigned add and subtract.
+                if v.omod != 0 {
+                    return Err("integer output modifiers");
+                }
+                let (a, b) = (s(self, 0)?, s(self, 1)?);
+                let add = name == "v_add_nc_i32";
+                let r = self.s.m.bin(c, if add { Bin::Add } else { Bin::Sub }, a, b);
+                let r = if v.clamp {
+                    // Overflow: the result's sign differs from a's, and b's
+                    // sign agrees with a's (an add) or differs (a subtract).
+                    let ar = self.s.m.bin(c, Bin::Xor, a, r);
+                    let other = if add { r } else { a };
+                    let b_side = self.s.m.bin(c, Bin::Xor, b, other);
+                    let both = self.s.m.bin(c, Bin::And, ar, b_side);
+                    let zero = self.s.m.i32(0);
+                    let overflow = self.s.m.cmp(c, pred::SLT, both, zero);
+                    // The limit on a's side: 0x80000000 if a < 0, else 0x7FFFFFFF.
+                    let (k31, max) = (self.s.m.i32(31), self.s.m.i32(0x7FFF_FFFF));
+                    let sign = self.s.m.bin(c, Bin::AShr, a, k31);
+                    let limit = self.s.m.bin(c, Bin::Xor, sign, max);
+                    self.s.m.select(c, overflow, limit, r)
+                } else {
+                    r
+                };
+                let Some(Operand::Vector { reg, .. }) = v.dst else {
+                    return Err("a result without a register");
+                };
+                self.write(inst, Reg::V(reg), r, guard);
+                Ok(())
+            }
             "v_mad_u64_u32" => {
                 // a * b + c, c and the result 64 bits wide; the carry out
                 // of the sum is this lane's bit of the mask it names.
@@ -8246,6 +8280,8 @@ impl<'a> Lower<'a> {
             "v_add_nc_u16",
             "v_sub_nc_u16",
             "v_subrev_nc_u16",
+            "v_add_nc_i16",
+            "v_sub_nc_i16",
             "v_mul_lo_u16",
             "v_lshlrev_b16",
             "v_lshrrev_b16",
@@ -8446,7 +8482,9 @@ impl<'a> Lower<'a> {
             return self.write_half(inst, r, guard);
         }
         // 16-bit integers: computed on the low halves, the low 16 bits kept.
-        if v.clamp || v.omod != 0 || v.abs != 0 || v.neg != 0 {
+        // The signed adds saturate under clamp.
+        let saturates = matches!(name, "v_add_nc_i16" | "v_sub_nc_i16");
+        if v.clamp && !saturates || v.omod != 0 || v.abs != 0 || v.neg != 0 {
             return Err("modifiers on a 16-bit integer operation");
         }
         let r = {
@@ -8501,6 +8539,23 @@ impl<'a> Lower<'a> {
             match name {
                 "v_add_nc_u16" => self.s.m.bin(c, Bin::Add, a, b),
                 "v_sub_nc_u16" => self.s.m.bin(c, Bin::Sub, a, b),
+                "v_add_nc_i16" | "v_sub_nc_i16" => {
+                    // RDNA2 ISA: D.i16 = S0.i16 +/- S1.i16, saturating to
+                    // the signed 16-bit range with clamp (LLVM selects
+                    // these for llvm.sadd.sat/ssub.sat on i16). The
+                    // sign-extended operands' sum cannot overflow i32.
+                    let op = if name == "v_add_nc_i16" { Bin::Add } else { Bin::Sub };
+                    let r = self.s.m.bin(c, op, a, b);
+                    if v.clamp {
+                        let (lo, hi) = (self.s.m.i32(0xFFFF_8000), self.s.m.i32(0x7FFF));
+                        let under = self.s.m.cmp(c, pred::SLT, r, lo);
+                        let r = self.s.m.select(c, under, lo, r);
+                        let over = self.s.m.cmp(c, pred::SGT, r, hi);
+                        self.s.m.select(c, over, hi, r)
+                    } else {
+                        r
+                    }
+                }
                 "v_subrev_nc_u16" => self.s.m.bin(c, Bin::Sub, b, a),
                 "v_mul_lo_u16" => self.s.m.bin(c, Bin::Mul, a, b),
                 "v_lshlrev_b16" | "v_lshrrev_b16" | "v_ashrrev_i16" => {
