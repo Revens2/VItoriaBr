@@ -686,8 +686,19 @@ fn create() -> windows::core::Result<Host> {
             let adapter = warp_adapter()?;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
+        } else if let Some((adapter, name)) = host_adapter() {
+            // Not the default adapter: on a laptop that is the integrated
+            // GPU (waves of 16 at most, a fraction of the card's speed).
+            match D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device) {
+                Ok(()) => tracing::info!("host device on {name}"),
+                Err(e) => {
+                    tracing::warn!("no host device on {name} ({e}); the default adapter instead");
+                    D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+                }
+            }
         } else {
             D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            tracing::info!("host device on the default adapter");
             // Whether a GPU hang ends the run or freezes the PC (#1054).
             crate::tdr::log();
         }
@@ -785,6 +796,46 @@ fn create() -> windows::core::Result<Host> {
             presenter: Mutex::new(None),
             adapter,
         })
+    }
+}
+
+/// The adapter the host device is made on: `VICTORY_ADAPTER=<part of its
+/// name>` if set, else the one DXGI ranks fastest (a laptop's card, not its
+/// integrated GPU, which is the default adapter there). Software adapters
+/// are passed over. `None`: let D3D12 take the default.
+fn host_adapter() -> Option<(IDXGIAdapter1, String)> {
+    let wanted = std::env::var("VICTORY_ADAPTER").ok().filter(|n| !n.is_empty());
+    // SAFETY: plain DXGI adapter queries.
+    unsafe {
+        let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+        for i in 0.. {
+            let Ok(adapter) = factory
+                .EnumAdapterByGpuPreference::<IDXGIAdapter1>(i, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE)
+            else {
+                break;
+            };
+            let Ok(desc) = adapter.GetDesc1() else { continue };
+            let len = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
+            let name = String::from_utf16_lossy(&desc.Description[..len]);
+            let software = desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0;
+            let take = match &wanted {
+                Some(wanted) => name.to_lowercase().contains(&wanted.to_lowercase()),
+                None => !software,
+            };
+            if take {
+                return Some((adapter, name));
+            }
+        }
+        if let Some(wanted) = wanted {
+            tracing::warn!("VICTORY_ADAPTER={wanted:?} names no adapter; the fastest instead");
+            // SAFETY: as above, without the name filter.
+            let adapter: IDXGIAdapter1 =
+                factory.EnumAdapterByGpuPreference(0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE).ok()?;
+            let desc = adapter.GetDesc1().ok()?;
+            let len = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
+            return Some((adapter, String::from_utf16_lossy(&desc.Description[..len])));
+        }
+        None
     }
 }
 
@@ -891,6 +942,16 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn the_host_adapter_is_a_hardware_one_when_there_is_one() {
+        // Probes DXGI only. On a hosted runner there may be none.
+        let Some((adapter, name)) = super::host_adapter() else { return };
+        // SAFETY: a DXGI adapter query.
+        let desc = unsafe { adapter.GetDesc1() }.unwrap();
+        eprintln!("host adapter: {name}");
+        assert_eq!(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32, 0, "{name}");
+    }
 
     #[test]
     fn warp_adapter_accepts_only_software() {
