@@ -3279,6 +3279,21 @@ mod fill_check {
 /// refresh leaves ranges shaders are writing alone (`Shadow::update`), so
 /// the title's bytes there would reach the card a submission late.
 fn stale_under_flights(runs: &[&HostList]) -> bool {
+    stale_under_flights_in(runs, &mut Vec::new())
+}
+
+/// `VICTORY_STALE_TARGETED=1` (default off): a submission that finds title
+/// bytes it cannot put in beside flights' shader writes waits only until the
+/// flights that declared those ranges have landed (as a read of them does,
+/// `WHY_READ`), not for everything in the air. Needs [`relay_exact`].
+fn stale_targeted() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_STALE_TARGETED").is_some_and(|v| v == "1"))
+}
+
+/// As [`stale_under_flights`]; `spans_out` gets the ranges (`(from, to)`)
+/// of the host copies that are refreshed and that flights may write.
+fn stale_under_flights_in(runs: &[&HostList], spans_out: &mut Vec<(usize, usize)>) -> bool {
     use std::sync::Arc;
     // Per copy, the span of what is refreshed (a flush brings that much
     // up to date at most).
@@ -3295,6 +3310,7 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
             }
         }
     }
+    spans_out.extend(spans.iter().map(|s| (s.1, s.2)));
     if late_exact() {
         // The title's bytes are put in beside the flights' writes; a
         // settle is still due where that could not be done. At most this
@@ -5559,6 +5575,22 @@ impl Host {
         number
     }
 
+    /// `WHY_STALE`: with `VICTORY_STALE_TARGETED=1` and the relay's second
+    /// stage, waits only until no flight in the air names `spans` (the
+    /// ranges the submission refreshes that flights may write), which
+    /// lands them in order, and asks again; if title bytes still cannot be
+    /// put in beside shader writes (a flight declared the range anew, the
+    /// runs cap is met), everything in the air is settled as before.
+    fn settle_stale(&self, runs: &[&HostList], spans: &[(usize, usize)], submitted: &mut u64) {
+        if stale_targeted() && relay() && relay_exact() && late() {
+            relay_wait(WHY_STALE, |line| !spans.iter().any(|&(from, to)| touches(&line.written, from, to)));
+            if !stale_under_flights(runs) {
+                return;
+            }
+        }
+        self.settle(submitted, WHY_STALE);
+    }
+
     /// Waits for the card to run every flight in the air ([`late`]) and
     /// does what they left to do, as [`Host::execute`] does for one
     /// submission after its wait: the pieces their shaders wrote in copies
@@ -5803,16 +5835,20 @@ impl Host {
             // may write too, and this submission refreshes it. The flights
             // are settled, and the asking made again: the copy-back wrote
             // title memory, which other copies of it must see.
-            if behind && stale_under_flights(runs) {
+            let mut stale = Vec::new();
+            if behind && stale_under_flights_in(runs, &mut stale) {
                 let settling = std::time::Instant::now();
-                self.settle(&mut submitted, WHY_STALE);
+                self.settle_stale(runs, &stale, &mut submitted);
                 settled += settling.elapsed();
                 crate::watch::ask_once(&ranges);
             }
-        } else if behind && stale_under_flights(runs) {
-            let settling = std::time::Instant::now();
-            self.settle(&mut submitted, WHY_STALE);
-            settled += settling.elapsed();
+        } else {
+            let mut stale = Vec::new();
+            if behind && stale_under_flights_in(runs, &mut stale) {
+                let settling = std::time::Instant::now();
+                self.settle_stale(runs, &stale, &mut submitted);
+                settled += settling.elapsed();
+            }
         }
         for list in runs {
             list.run_deferred(&mut batch);
