@@ -7915,7 +7915,7 @@ impl HostList {
                         add(C::CopyBytes, len as u64);
                         fill_check::runs(src, len);
                     }
-                    let threads = copy_threads();
+                    let threads = if prep_par_copy() { 16 } else { copy_threads() };
                     if threads > 1 && matches!(steps.get(next), Some(Step::Fill(..))) {
                         // `VICTORY_COPY_THREADS`: the fills that follow each
                         // other, with nothing between them that could write
@@ -8567,6 +8567,28 @@ const FILLS_PIECE: usize = 1 << 20;
 fn copy_fills(fills: &[(usize, usize, usize)], threads: usize) -> usize {
     use std::sync::atomic::AtomicUsize;
     let total: usize = fills.iter().map(|f| f.2).sum();
+    if prep_par_copy() {
+        // `VICTORY_PREP_PAR_COPY=1`: the kept `victory-wide-N` threads.
+        let n = crate::shadow::wide_workers() + 1;
+        if let Some(groups) = split_fills(fills, n) {
+            let jobs: Vec<Box<dyn FnOnce() + Send>> = groups
+                .into_iter()
+                .map(|group| {
+                    Box::new(move || {
+                        for (dst, src, len) in group {
+                            copy_mapped(dst as *mut u8, src as *const u8, len, false);
+                        }
+                    }) as Box<dyn FnOnce() + Send>
+                })
+                .collect();
+            crate::shadow::wide_run(jobs);
+            return total;
+        }
+        for &(dst, src, len) in fills {
+            copy_mapped(dst as *mut u8, src as *const u8, len, false);
+        }
+        return total;
+    }
     let overlap = || {
         let mut by_dst: Vec<(usize, usize)> = fills.iter().map(|f| (f.0, f.0 + f.2)).collect();
         by_dst.sort_unstable();
@@ -8604,6 +8626,44 @@ fn copy_fills(fills: &[(usize, usize, usize)], threads: usize) -> usize {
         work();
     });
     total
+}
+
+/// `VICTORY_PREP_PAR_COPY=1` (off by default): the fills that follow each
+/// other in a submission are copied on the kept `victory-wide-N` threads
+/// ([`split_fills`]), whatever `VICTORY_COPY_THREADS` says.
+fn prep_par_copy() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PREP_PAR_COPY").is_some_and(|v| v == "1"))
+}
+
+/// Cuts `fills` (`(destination, source, length)`) into at most `jobs` groups
+/// of copies of about equal bytes, each fill cut into pieces of at most
+/// [`FILLS_PIECE`] bytes dealt out in order, so that the groups are the same
+/// every time. `None`: do them one after the other as recorded (under
+/// [`FILLS_WIDE_FROM`] bytes, or two destinations overlap: the later one must
+/// win).
+fn split_fills(fills: &[(usize, usize, usize)], jobs: usize) -> Option<Vec<Vec<(usize, usize, usize)>>> {
+    let total: usize = fills.iter().map(|f| f.2).sum();
+    let mut by_dst: Vec<(usize, usize)> = fills.iter().map(|f| (f.0, f.0 + f.2)).collect();
+    by_dst.sort_unstable();
+    if total < FILLS_WIDE_FROM || jobs < 2 || by_dst.windows(2).any(|w| w[1].0 < w[0].1) {
+        return None;
+    }
+    let mut groups = vec![Vec::new(); jobs];
+    let mut loads = vec![0usize; jobs];
+    for &(dst, src, len) in fills {
+        let mut at = 0;
+        while at < len {
+            let n = (len - at).min(FILLS_PIECE);
+            // The lightest group (the first of equals).
+            let g = (0..jobs).min_by_key(|&g| loads[g]).unwrap_or(0);
+            groups[g].push((dst + at, src + at, n));
+            loads[g] += n;
+            at += n;
+        }
+    }
+    groups.retain(|g| !g.is_empty());
+    Some(groups)
 }
 
 /// `VICTORY_COPY_ONCE` (default 1; `0` = as before): [`copy_mapped`] reads
@@ -10447,5 +10507,52 @@ void main() {
             }
         }
         drop((a, b, trial));
+    }
+}
+
+#[cfg(test)]
+mod prep_par_tests {
+    use super::split_fills;
+
+    fn rng(seed: &mut u64) -> usize {
+        *seed ^= *seed << 13;
+        *seed ^= *seed >> 7;
+        *seed ^= *seed << 17;
+        *seed as usize
+    }
+
+    /// The groups, run in any order, leave the same bytes as the fills one
+    /// after the other, on random fills (overlapping destinations go back
+    /// to the one-after-the-other path, `None`).
+    #[test]
+    fn split_fills_equals_sequential_on_random_fills() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut split_seen = 0;
+        for _ in 0..200 {
+            let size = 6 << 20;
+            let src: Vec<u8> = (0..size).map(|_| rng(&mut seed) as u8).collect();
+            let mut want = vec![0u8; size];
+            let mut fills = Vec::new();
+            for _ in 0..(1 + rng(&mut seed) % 12) {
+                let len = 1 + rng(&mut seed) % (3 << 20);
+                let (d, s) = (rng(&mut seed) % (size - len), rng(&mut seed) % (size - len));
+                fills.push((d, s, len));
+            }
+            for &(d, s, n) in &fills {
+                want[d..d + n].copy_from_slice(&src[s..s + n]);
+            }
+            let jobs = 2 + rng(&mut seed) % 8;
+            let Some(groups) = split_fills(&fills, jobs) else { continue };
+            split_seen += 1;
+            assert_eq!(Some(groups.clone()), split_fills(&fills, jobs), "deterministic");
+            let mut got = vec![0u8; size];
+            for group in groups.iter().rev() {
+                for &(d, s, n) in group {
+                    got[d..d + n].copy_from_slice(&src[s..s + n]);
+                }
+            }
+            assert!(got == want, "same bytes");
+        }
+        assert!(split_seen > 0, "some random case must split");
     }
 }

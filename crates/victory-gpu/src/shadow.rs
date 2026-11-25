@@ -1888,6 +1888,12 @@ fn workers() -> &'static Workers {
     workers
 }
 
+/// The kept `victory-wide-N` threads (started if need be).
+pub(crate) fn wide_workers() -> usize {
+    let _ = workers();
+    wide_worker_count(std::thread::available_parallelism().map_or(4, |n| n.get()))
+}
+
 /// Runs `jobs` on the kept threads and on this one, and returns when all
 /// of them are done. The jobs copy and compare memory; they do not panic.
 fn wide(jobs: Vec<Job>) {
