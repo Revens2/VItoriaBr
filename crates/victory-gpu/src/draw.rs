@@ -3257,11 +3257,20 @@ impl State {
         const MESH: u32 = 10;
         #[cfg(feature = "diagnostics")]
         let why = |what: &str| crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
+        // Why a call did not run, once per kind and reason.
         #[cfg(not(feature = "diagnostics"))]
-        let why = |_: &str| {};
+        let why = |what: &str| {
+            static SEEN: std::sync::Mutex<Vec<(u32, String)>> = std::sync::Mutex::new(Vec::new());
+            let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+            if seen.len() < 32 && !seen.iter().any(|(k, w)| *k == kind && w == what) {
+                seen.push((kind, what.to_owned()));
+                tracing::info!(kind, what, "indirect execution not run (first time for this reason)");
+            }
+        };
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
+            why("no host pipeline");
             return false;
         };
         // Indirect rectangles (the title's tiled lighting, 256
