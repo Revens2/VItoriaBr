@@ -12,6 +12,9 @@
 //! `VICTORY_AMBIENT=<level>` sets it (0.6 by default, 0 for none); `off`
 //! keeps the title's own output. `VICTORY_AMBIENT_TINT=r,g,b` sets the tint,
 //! and `VICTORY_AMBIENT_SHADE=s,r,n,t` sets depth-occlusion shading.
+//! The ambient light follows the rendered sky dome by default when available.
+//! `VICTORY_AMBIENT_SKY=off` keeps the constant.
+//! `VICTORY_AMBIENT_SKY=gain,least,power` tunes the response.
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -77,11 +80,79 @@ struct Live {
     floor: f32,
 }
 
-static LIVE: std::sync::Mutex<Option<Live>> = std::sync::Mutex::new(None);
+#[derive(Clone, Copy)]
+struct AmbientFile {
+    constant: Option<Live>,
+    sky: Option<[f32; 3]>,
+}
+
+static LIVE: std::sync::Mutex<AmbientFile> = std::sync::Mutex::new(AmbientFile {
+    constant: None,
+    sky: None,
+});
 
 /// The last reflection history update and the UAV it writes.
 pub(crate) const REFLECTED: &[u8] = b"CS_UpdateHistory";
 pub(crate) const REFLECTIONS: (u8, u32) = (1, 40);
+
+/// The program that draws the sky as the title reflects it, by the start of
+/// its name: a small image of the whole sky, in the light's own units.
+pub(crate) const SKY: &[u8] = b"ps_sky_paraboloid_reflection";
+
+/// The sky dome that program last drew into: the host copy, held, since
+/// the title's object may go at any time.
+///
+/// The program draws twice a frame, on two lists recorded at once: the dome
+/// (128x128, R16G16B16A16_FLOAT) and another image of the sky (R11G11B10).
+/// Following whichever was recorded last made the light jump between the
+/// two, three times apart, from frame to frame (run don1, 2026-11-25).
+static SKY_IMAGE: std::sync::Mutex<Option<std::sync::Arc<crate::resource::HostTexture>>> =
+    std::sync::Mutex::new(None);
+
+pub(crate) fn sky_drawn(image: usize) {
+    if level().is_none_or(|level| level == 0.0) || sky_settings().is_none() {
+        return;
+    }
+    let Some(copy) = crate::resource::host_copy(image as This) else {
+        return;
+    };
+    // SAFETY: a live resource.
+    let d = unsafe { copy.texture.GetDesc() };
+    if d.Format != DXGI_FORMAT_R16G16B16A16_FLOAT
+        || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
+    {
+        return;
+    }
+    let mut held = SKY_IMAGE.lock().unwrap_or_else(|e| e.into_inner());
+    if !held
+        .as_ref()
+        .is_some_and(|h| std::sync::Arc::ptr_eq(h, &copy))
+    {
+        *held = Some(copy);
+    }
+}
+
+const DEFAULT_SKY: [f32; 3] = [0.36, 0.05, 0.4];
+
+fn sky_settings() -> Option<[f32; 3]> {
+    static SETTINGS: OnceLock<Option<[f32; 3]>> = OnceLock::new();
+    *SETTINGS.get_or_init(|| {
+        let set = std::env::var("VICTORY_AMBIENT_SKY").unwrap_or_default();
+        if set.trim() == "off" {
+            return None;
+        }
+        let mut settings = DEFAULT_SKY;
+        for (to, value) in settings.iter_mut().zip(set.split(',')) {
+            if let Ok(value) = value.trim().parse::<f32>()
+                && value.is_finite()
+                && value >= 0.0
+            {
+                *to = value;
+            }
+        }
+        Some(settings)
+    })
+}
 
 /// Where the resolve reads the scene's depth (reversed, D32 with stencil):
 /// root parameter and place in its table.
@@ -113,8 +184,10 @@ fn shade() -> [f32; 4] {
 /// Reads `VICTORY_AMBIENT_FILE` twice a second in diagnostics builds. Its
 /// values are `level r g b`, optionally followed by `strength radius near
 /// tan_y` and then the reflection ceiling and floor as fractions of ambient
-/// light. Zero disables the corresponding reflection bound.
-fn live_settings() -> Option<Live> {
+/// light. Zero disables the corresponding reflection bound. A file with
+/// two or three values sets sky gain, minimum and optional power. Add four
+/// values to that form to adjust depth shading.
+fn live_settings() -> AmbientFile {
     static STARTED: std::sync::Once = std::sync::Once::new();
     STARTED.call_once(|| {
         if !cfg!(feature = "diagnostics") {
@@ -132,7 +205,23 @@ fn live_settings() -> Option<Live> {
                         .split_whitespace()
                         .filter_map(|v| v.parse().ok())
                         .collect();
-                    if let [level, r, g, b, ref rest @ ..] = read[..] {
+                    if matches!(read.len(), 2 | 3 | 6 | 7) {
+                        let sky_values = if read.len() >= 6 {
+                            read.len() - 4
+                        } else {
+                            read.len()
+                        };
+                        let mut settings = DEFAULT_SKY;
+                        for (to, &value) in settings.iter_mut().zip(&read[..sky_values]) {
+                            if value.is_finite() && value >= 0.0 {
+                                *to = value;
+                            }
+                        }
+                        if let [s, rad, n, t] = read[sky_values..] {
+                            *SHADE.lock().unwrap_or_else(|e| e.into_inner()) = Some([s, rad, n, t]);
+                        }
+                        LIVE.lock().unwrap_or_else(|e| e.into_inner()).sky = Some(settings);
+                    } else if let [level, r, g, b, ref rest @ ..] = read[..] {
                         if let [s, rad, n, t, ..] = rest[..] {
                             *SHADE.lock().unwrap_or_else(|e| e.into_inner()) = Some([s, rad, n, t]);
                         }
@@ -150,9 +239,12 @@ fn live_settings() -> Option<Live> {
                             floor: fraction(5),
                         });
                         let mut live = LIVE.lock().unwrap_or_else(|e| e.into_inner());
-                        if *live != new {
+                        if live.constant != new || live.sky.is_some() {
                             tracing::info!(level, r, g, b, "ambient light set from the file");
-                            *live = new;
+                            *live = AmbientFile {
+                                constant: new,
+                                sky: None,
+                            };
                         }
                     }
                     std::thread::sleep(std::time::Duration::from_millis(500));
@@ -163,12 +255,35 @@ fn live_settings() -> Option<Live> {
 }
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=10, b0), DescriptorTable(UAV(u0), SRV(t0))"
+#define RS "RootConstants(num32BitConstants=13, b0), DescriptorTable(UAV(u0), SRV(t0), SRV(t1))"
 cbuffer Floor : register(b0) {
     float level; float3 tint;
     float strength; float radius; float near; float tan_y;
     float held; float floor_part;
+    float gain; float least; float power;
 };
+Texture2DArray<float4> sky : register(t1);
+// The light, from the sky's mean when it follows the sky (gain above 0).
+float3 from_around() {
+    if (gain <= 0.0) return tint * level;
+    uint sw, sh, slices;
+    sky.GetDimensions(sw, sh, slices);
+    float3 sum = 0.0;
+    const int N = 8;
+    for (int y = 0; y < N; y++)
+        for (int x = 0; x < N; x++) {
+            // The sun's own texels are held down: it lights by itself.
+            float3 there = sky.Load(int4((x * 2 + 1) * sw / (N * 2), (y * 2 + 1) * sh / (N * 2), 0, 0)).rgb;
+            sum += clamp(there, 0.0, 8.0);
+        }
+    float3 mean = sum / (N * N);
+    float m = dot(mean, float3(0.2126, 0.7152, 0.0722));
+    // The sky's colour, half washed out (the ground lights too); a dark
+    // sky has none worth following.
+    const float3 NIGHT = float3(0.6, 0.75, 1.0);
+    float3 hue = lerp(NIGHT, lerp(float3(1.0, 1.0, 1.0), mean / max(m, 1e-6), 0.5), saturate(m / 0.05));
+    return hue * (gain * pow(max(m, 0.0), power) + least);
+}
 RWTexture2D<uint> light : register(u0);
 Texture2D<float> depth : register(t0);
 float3 seen(int2 p, float2 size) {
@@ -214,13 +329,19 @@ uint pack(float3 c) {
     uint3 m = min(uint3(c * scale + 0.5), 511u);
     return m.r | (m.g << 9) | (m.b << 18) | (uint(e) << 27);
 }
+groupshared float3 group_ambient;
 [RootSignature(RS)]
 [numthreads(8, 8, 1)]
-void main(uint3 at : SV_DispatchThreadID) {
+void main(uint3 at : SV_DispatchThreadID, uint lane : SV_GroupIndex) {
+    float3 ambient = tint * level;
+    if (gain > 0.0) {
+        if (lane == 0) group_ambient = from_around();
+        GroupMemoryBarrierWithGroupSync();
+        ambient = group_ambient;
+    }
     uint w, h;
     light.GetDimensions(w, h);
     if (at.x >= w || at.y >= h) return;
-    float3 ambient = tint * level;
     if (held > 0.0 || floor_part > 0.0) {
         const float3 LUMA = float3(0.2126, 0.7152, 0.0722);
         float3 reflection = unpack(light[at.xy]);
@@ -296,7 +417,7 @@ fn make(device: &ID3D12Device) -> windows::core::Result<Pass> {
         let kind = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
         let views = device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
             Type: kind,
-            NumDescriptors: SLOTS * 2,
+            NumDescriptors: SLOTS * 3,
             Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
             NodeMask: 0,
         })?;
@@ -335,7 +456,8 @@ fn record(list: &HostList, light: This, depth: Option<This>, reflections: bool) 
     let (Some(level), Some(host)) = (level(), host()) else {
         return false;
     };
-    let live = live_settings();
+    let file = live_settings();
+    let live = file.constant;
     let mut bounds = [0.0; 2];
     if reflections {
         let Some(live) = live else {
@@ -375,7 +497,25 @@ fn record(list: &HostList, light: This, depth: Option<This>, reflections: bool) 
     ONCE.call_once(|| {
         tracing::info!(level, width = d.Width, height = d.Height, "ambient light");
     });
-    let slot = pass.next.fetch_add(1, Ordering::Relaxed) % SLOTS * 2;
+    let slot = pass.next.fetch_add(1, Ordering::Relaxed) % SLOTS * 3;
+    let sky = sky_settings()
+        .map(|settings| file.sky.unwrap_or(settings))
+        .filter(|settings| {
+            level > 0.0 && settings[0] > 0.0 && (live.is_none() || file.sky.is_some())
+        })
+        .and_then(|settings| {
+            let image = SKY_IMAGE
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()?;
+            Some((image, settings))
+        });
+    if let Some((image, _)) = &sky {
+        list.settle(
+            image,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE.0 as u32,
+        );
+    }
     list.keep(light);
     // The depth the resolve just read, in the state it read it in; of the
     // light's size, or the shading is left out.
@@ -421,6 +561,26 @@ fn record(list: &HostList, light: This, depth: Option<This>, reflections: bool) 
         };
         host.device
             .CreateShaderResourceView(depth, Some(&seen), beside);
+        let around = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2DArray: D3D12_TEX2D_ARRAY_SRV {
+                    MipLevels: 1,
+                    ArraySize: 1,
+                    ..Default::default()
+                },
+            },
+        };
+        let third = D3D12_CPU_DESCRIPTOR_HANDLE {
+            ptr: at.ptr + 2 * pass.step as usize,
+        };
+        host.device.CreateShaderResourceView(
+            sky.as_ref().map(|(image, _)| &image.texture),
+            Some(&around),
+            third,
+        );
         l.SetDescriptorHeaps(&[Some(pass.views.clone())]);
         l.SetComputeRootSignature(&pass.root);
         l.SetPipelineState(&pass.pso);
@@ -429,7 +589,12 @@ fn record(list: &HostList, light: This, depth: Option<This>, reflections: bool) 
         let [strength, radius, near, tan_y] = shade();
         let strength = if depth.is_some() { strength } else { 0.0 };
         let [held, floor] = bounds;
-        let constants = [level, r, g, b, strength, radius, near, tan_y, held, floor];
+        let [gain, least, power] = sky
+            .as_ref()
+            .map_or([0.0, 0.0, 1.0], |(_, settings)| *settings);
+        let constants = [
+            level, r, g, b, strength, radius, near, tan_y, held, floor, gain, least, power,
+        ];
         l.SetComputeRoot32BitConstants(0, constants.len() as u32, constants.as_ptr().cast(), 0);
         l.SetComputeRootDescriptorTable(
             1,

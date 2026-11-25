@@ -73,6 +73,9 @@ pub(crate) struct Shader {
     /// Its last reflection output can be bounded by the ambient light.
     #[cfg(windows)]
     pub(crate) ends_reflections: bool,
+    /// Its output can provide the sky dome for ambient lighting.
+    #[cfg(windows)]
+    pub(crate) draws_sky: bool,
 }
 
 impl std::fmt::Debug for Shader {
@@ -133,6 +136,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 ends_reflections: bytes
                     .windows(crate::ambient::REFLECTED.len())
                     .any(|w| w == crate::ambient::REFLECTED),
+                #[cfg(windows)]
+                draws_sky: bytes.windows(crate::ambient::SKY.len()).any(|w| w == crate::ambient::SKY),
             })
         })
         .clone()
