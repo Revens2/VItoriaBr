@@ -3656,7 +3656,39 @@ fn late_line(frames: f64) {
 
 #[cfg(test)]
 mod late_tests {
-    use super::{continues, join_ranges, touches};
+    use super::{RangesByCopy, continues, join_ranges, touches};
+
+    /// Ranges are gathered per copy, each once, in the order first given,
+    /// as the search of lists did.
+    #[test]
+    fn declared_ranges_gather_per_copy_once_each() {
+        let given = [(7, (0, 16)), (3, (8, 24)), (7, (0, 16)), (7, (32, 48)), (3, (8, 24)), (9, (1, 2)), (7, (0, 17))];
+        let mut by = RangesByCopy::default();
+        let mut made = Vec::new();
+        for (key, range) in given {
+            by.add(key, || {
+                made.push(key);
+                format!("copy {key}")
+            }, range);
+        }
+        // Each copy's entry made once.
+        assert_eq!(made, [7, 3, 9]);
+        // As the old search did it.
+        let mut old: Vec<(String, Vec<(usize, usize)>)> = Vec::new();
+        for (key, range) in given {
+            let name = format!("copy {key}");
+            match old.iter_mut().find(|(n, _)| *n == name) {
+                Some((_, ranges)) => {
+                    if !ranges.contains(&range) {
+                        ranges.push(range);
+                    }
+                }
+                None => old.push((name, vec![range])),
+            }
+        }
+        assert_eq!(by.ranges, old);
+        assert_eq!(by.ranges[0].1, [(0, 16), (32, 48), (0, 17)]);
+    }
 
     /// Copies join only when both ends continue and the whole does not
     /// overlap itself.
@@ -3750,23 +3782,57 @@ fn continues(last: (usize, usize, usize), next: (usize, usize, usize)) -> bool {
 /// The ranges the shaders of `runs` may write, per host copy, as declared.
 /// One list's lock at a time: a submission may name a list twice.
 fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
-    let mut back: Vec<Declared> = Vec::new();
+    declared_where(runs, |_| true)
+}
+
+/// [`declared_writes`] of the host copies `which` takes.
+fn declared_where(runs: &[&HostList], which: impl Fn(&crate::shadow::Shadow) -> bool) -> Vec<Declared> {
+    let mut back = RangesByCopy::default();
     for list in runs {
         for step in &list.deferred().copies {
-            if let Step::GpuWrite(shadow, address, len) = step {
-                let range = (*address, *address + *len);
-                match back.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
-                    Some((_, ranges)) => {
-                        if !ranges.contains(&range) {
-                            ranges.push(range);
-                        }
-                    }
-                    None => back.push((shadow.clone(), vec![range])),
-                }
+            if let Step::GpuWrite(shadow, address, len) = step
+                && which(shadow)
+            {
+                back.add(std::sync::Arc::as_ptr(shadow) as usize, || shadow.clone(), (*address, *address + *len));
             }
         }
     }
-    back
+    back.ranges
+}
+
+/// Ranges gathered per host copy, each once, copies and ranges in the order
+/// first given. Dispatches declare the same few ranges thousands of times
+/// a submission: a search of the copies and of each copy's ranges for every
+/// one of them grew with the square of the ranges.
+struct RangesByCopy<T> {
+    ranges: Vec<(T, Vec<(usize, usize)>)>,
+    /// A copy's place in `ranges`, by its key.
+    at: std::collections::HashMap<usize, usize>,
+    /// What was given: key, range.
+    seen: std::collections::HashSet<(usize, usize, usize)>,
+}
+
+impl<T> Default for RangesByCopy<T> {
+    fn default() -> Self {
+        RangesByCopy { ranges: Vec::new(), at: Default::default(), seen: Default::default() }
+    }
+}
+
+impl<T> RangesByCopy<T> {
+    /// `range` of the copy `key` names; `copy` makes its entry the first
+    /// time.
+    fn add(&mut self, key: usize, copy: impl FnOnce() -> T, range: (usize, usize)) {
+        if !self.seen.insert((key, range.0, range.1)) {
+            return;
+        }
+        match self.at.entry(key) {
+            std::collections::hash_map::Entry::Occupied(at) => self.ranges[*at.get()].1.push(range),
+            std::collections::hash_map::Entry::Vacant(at) => {
+                at.insert(self.ranges.len());
+                self.ranges.push((copy(), vec![range]));
+            }
+        }
+    }
 }
 
 /// The walls trace (`VICTORY_WALLS_TRACE=1` or `2`; off by default): log
@@ -4261,24 +4327,7 @@ impl Host {
             return None;
         }
         // The ranges this submission's shaders may write, per copy.
-        let mut declared: Vec<(Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> = Vec::new();
-        for list in runs {
-            for step in &list.deferred().copies {
-                if let Step::GpuWrite(shadow, address, len) = step
-                    && shadow.carded()
-                {
-                    let range = (*address, *address + *len);
-                    match declared.iter_mut().find(|(s, _)| Arc::ptr_eq(s, shadow)) {
-                        Some((_, ranges)) => {
-                            if !ranges.contains(&range) {
-                                ranges.push(range);
-                            }
-                        }
-                        None => declared.push((shadow.clone(), vec![range])),
-                    }
-                }
-            }
-        }
+        let declared = declared_where(runs, crate::shadow::Shadow::carded);
         // With the relay: the order of the queue is held from here until
         // what is taken is on the queue, and the taking is numbered.
         let mut order = relay().then(|| QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));

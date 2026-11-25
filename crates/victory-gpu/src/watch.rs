@@ -358,11 +358,21 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
         slow(started.elapsed().as_micros() as u64);
     }
     let now = j.ahead_asked;
-    for k in 0..count {
-        let page = j.found[k] / PAGE;
-        j.written.insert(page, now);
-    }
+    note_written(&mut j.written, j.found[..count].iter().map(|&at| at / PAGE), now);
     true
+}
+
+/// Notes `pages` (in order, as the kernel lists its 4 KiB pages: up to 16
+/// in a row for one of ours) written at asking `now`, each run of one page
+/// once.
+fn note_written(written: &mut BTreeMap<usize, u64>, pages: impl IntoIterator<Item = usize>, now: u64) {
+    let mut last = None;
+    for page in pages {
+        if last != Some(page) {
+            written.insert(page, now);
+            last = Some(page);
+        }
+    }
 }
 
 /// What [`writes`] would say of `[start, end)` from the journal alone, if
@@ -471,12 +481,7 @@ pub(crate) fn writes_into(
     }
     j.asked += 1;
     let now = j.asked;
-    for k in 0..count {
-        j.written.insert(j.found[k] / PAGE, now);
-    }
-    for page in guarded {
-        j.written.insert(page, now);
-    }
+    note_written(&mut j.written, j.found[..count].iter().map(|&at| at / PAGE).chain(guarded), now);
     written.extend(j.written.range(first..last).map(|(&p, &w)| (p, w)));
     Some(now)
 }
@@ -1704,6 +1709,22 @@ mod tests {
     /// [`known_view`] says of the range's first block.
     fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         super::guard(start, end, known_view(start))
+    }
+
+    /// Noting each run of one page once leaves the journal as noting
+    /// every 4 KiB page did.
+    #[test]
+    fn runs_of_a_page_are_noted_once_to_the_same_effect() {
+        let found = [0usize, 1, 2, 15, 16, 17, 40, 41, 300];
+        let pages = || found.iter().map(|&k| k * KERNEL_PAGE / PAGE);
+        let mut every = BTreeMap::from([(1usize, 3u64), (99, 4)]);
+        let mut once = every.clone();
+        for page in pages() {
+            every.insert(page, 9);
+        }
+        note_written(&mut once, pages(), 9);
+        assert_eq!(once, every);
+        assert_eq!(once, BTreeMap::from([(0, 9), (1, 9), (2, 9), (18, 9), (99, 4)]));
     }
 
     #[test]
