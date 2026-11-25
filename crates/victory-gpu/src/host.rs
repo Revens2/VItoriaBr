@@ -7471,7 +7471,11 @@ impl HostList {
     fn run_deferred(&self, batch: &mut Batch) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
-        for step in &self.deferred().copies {
+        let deferred = self.deferred();
+        let steps = &deferred.copies;
+        let mut next = 0;
+        while let Some(step) = steps.get(next) {
+            next += 1;
             let started = std::time::Instant::now();
             let copied = match step {
                 Step::Copy(dst, src, len, parts) => {
@@ -7500,8 +7504,27 @@ impl HostList {
                         add(C::CopyBytes, len as u64);
                         fill_check::runs(src, len);
                     }
-                    copy_mapped(dst as *mut u8, src as *const u8, len, false);
-                    len
+                    let threads = copy_threads();
+                    if threads > 1 && matches!(steps.get(next), Some(Step::Fill(..))) {
+                        // `VICTORY_COPY_THREADS`: the fills that follow each
+                        // other, with nothing between them that could write
+                        // their sources, are read together.
+                        let mut jobs = vec![(dst, src, len)];
+                        while let Some(&Step::Fill(d, s, n)) = steps.get(next) {
+                            #[cfg(feature = "diagnostics")]
+                            {
+                                add(C::Copies, 1);
+                                add(C::CopyBytes, n as u64);
+                                fill_check::runs(s, n);
+                            }
+                            jobs.push((d, s, n));
+                            next += 1;
+                        }
+                        copy_fills(&jobs, threads)
+                    } else {
+                        copy_mapped(dst as *mut u8, src as *const u8, len, false);
+                        len
+                    }
                 }
                 Step::Refresh(shadow, address, len) => {
                     #[cfg(feature = "diagnostics")]
@@ -8102,6 +8125,74 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::SparseUs, sparse.elapsed().as_micros() as u64);
+}
+
+/// `VICTORY_COPY_THREADS=N` (default 1 = one thread, as before; at most 16):
+/// the fills of upload memory that follow each other in a submission are
+/// copied on up to N threads when they hold at least [`FILLS_WIDE_FROM`]
+/// bytes together.
+fn copy_threads() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_COPY_THREADS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map_or(1, |n| n.clamp(1, 16))
+    })
+}
+
+/// Fills together below this many bytes are copied on the calling thread:
+/// starting threads costs more than they save.
+const FILLS_WIDE_FROM: usize = 1 << 20;
+/// A fill is cut into pieces of about this many bytes for the threads.
+const FILLS_PIECE: usize = 1 << 20;
+
+/// Copies `fills` (`(destination, source, length)`, upload memory from title
+/// memory, as [`copy_mapped`] does with `title_dst` false) on up to `threads`
+/// threads; returns their bytes. Each piece goes through `copy_mapped` on its
+/// own, the kernel's fallback for a missing page included. The destinations
+/// are the lists' own memory; ranges that overlap are copied one after the
+/// other as recorded.
+fn copy_fills(fills: &[(usize, usize, usize)], threads: usize) -> usize {
+    use std::sync::atomic::AtomicUsize;
+    let total: usize = fills.iter().map(|f| f.2).sum();
+    let overlap = || {
+        let mut by_dst: Vec<(usize, usize)> = fills.iter().map(|f| (f.0, f.0 + f.2)).collect();
+        by_dst.sort_unstable();
+        by_dst.windows(2).any(|w| w[1].0 < w[0].1)
+    };
+    if total < FILLS_WIDE_FROM || overlap() {
+        for &(dst, src, len) in fills {
+            copy_mapped(dst as *mut u8, src as *const u8, len, false);
+        }
+        return total;
+    }
+    let mut pieces = Vec::with_capacity(fills.len());
+    for &(dst, src, len) in fills {
+        let mut at = 0;
+        while at < len {
+            let n = (len - at).min(FILLS_PIECE);
+            pieces.push((dst + at, src + at, n));
+            at += n;
+        }
+    }
+    let next = AtomicUsize::new(0);
+    let work = || {
+        loop {
+            let i = next.fetch_add(1, Ordering::Relaxed);
+            let Some(&(dst, src, len)) = pieces.get(i) else {
+                return;
+            };
+            copy_mapped(dst as *mut u8, src as *const u8, len, false);
+        }
+    };
+    std::thread::scope(|scope| {
+        for _ in 1..threads.min(pieces.len()) {
+            scope.spawn(work);
+        }
+        work();
+    });
+    total
 }
 
 /// `VICTORY_COPY_ONCE` (default 1; `0` = as before): [`copy_mapped`] reads
