@@ -1236,8 +1236,19 @@ mod tests {
             rig.store(&placed.buffer, placed.bias + 16, &[0xa5; 64]).unwrap();
             assert!(same((start + 16) as *const u8, &[0xa5; 64]), "the GPU's write is at the title's address");
             drop(placed);
+            drop(rig);
+            // The host may let the heap go a moment after its last reference
+            // (other tests share the device): until then the decommit fails.
+            let half = base.add(2 * K64).cast();
+            let decommitted = (0..500).any(|_| {
+                let done = mem::VirtualFree(half, K64, mem::MEM_DECOMMIT) != 0;
+                if !done {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                done
+            });
+            assert!(decommitted, "the heap on the pages was not let go");
             // Half of it decommitted: turned down, the host not asked.
-            assert_ne!(mem::VirtualFree(base.add(2 * K64).cast(), K64, mem::MEM_DECOMMIT), 0);
             assert!(matches!(place_part(&device, start, len), Err(None)));
             mem::VirtualFree(base.cast(), 0, mem::MEM_RELEASE);
         }
