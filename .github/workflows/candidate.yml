@@ -397,8 +397,10 @@ jobs:
                           count["failed"] += 1
                           failed.append(full)
                           log.write(text + "\n")
-                          kept = [l[:300] for l in text.splitlines() if l and not l.startswith("running ")]
-                          excerpts[full] = kept[:12]
+                          before, header, after = text.partition("---- %s stdout ----" % test)
+                          kept = [l[:300] for l in (after if header else before).splitlines()
+                                  if l and not l.startswith("running ")]
+                          excerpts[full] = ([text.splitlines()[0]] if state == "crashed" else []) + kept[:12]
                           if state != "failed":
                               entry["crashed_tests"].append("%s (%s)" % (test, state))
               entry["isolated"] = count
