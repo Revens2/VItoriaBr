@@ -1,0 +1,545 @@
+# Builds and tests candidate commits from other repositories on a GitHub
+# runner, on top of a ref of this fork. Candidate code is untrusted: the job has
+# a read-only token, no secrets and no persisted credentials.
+name: candidate
+run-name: cand ${{ inputs.id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      id:
+        description: Run label (A-Z a-z 0-9 . _ -)
+        required: true
+        type: string
+      repo:
+        description: Source repository, owner/name
+        required: false
+        type: string
+        default: Revens2/VItoriaBr
+      commits:
+        description: SHAs to cherry-pick, in order, space separated. Empty = reference run
+        required: false
+        type: string
+        default: ""
+      base:
+        description: Branch, tag or SHA of this fork
+        required: false
+        type: string
+        default: main
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: never
+  RUST_BACKTRACE: "1"
+
+jobs:
+  candidate:
+    runs-on: windows-latest
+    timeout-minutes: 110
+    steps:
+      - name: Validate inputs
+        shell: python -I {0}
+        env:
+          IN_ID: ${{ inputs.id }}
+          IN_REPO: ${{ inputs.repo }}
+          IN_COMMITS: ${{ inputs.commits }}
+          IN_BASE: ${{ inputs.base }}
+        run: |
+          import json, os, re, sys
+          out = os.path.join(os.environ["RUNNER_TEMP"], "cand")
+          os.makedirs(out, exist_ok=True)
+          e = os.environ
+          ident, repo, base = e["IN_ID"], e["IN_REPO"].strip(), e["IN_BASE"].strip() or "main"
+          commits = e["IN_COMMITS"].split()
+          errors = []
+          if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", ident):
+              errors.append("id: 1-64 characters among A-Z a-z 0-9 . _ -")
+          if commits and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}", repo):
+              errors.append("repo: expected owner/name")
+          if repo.endswith("/.") or repo.endswith("/.."):
+              errors.append("repo: invalid name")
+          if len(commits) > 100 or any(not re.fullmatch(r"[0-9a-fA-F]{7,40}", c) for c in commits):
+              errors.append("commits: at most 100 SHAs of 7-40 hex digits, space separated")
+          if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9._/-]{0,99}", base) or ".." in base:
+              errors.append("base: invalid ref")
+          res = {
+              "id": ident, "repo": repo, "commits": [c.lower() for c in commits], "base": base,
+              "reference": not commits, "run_url": None, "base_sha": None, "head_sha": None,
+              "verdict": None,
+              "apply": {"status": "not_run"}, "build": {"status": "not_run"}, "tests": {"status": "not_run"},
+          }
+          res["run_url"] = "%s/%s/actions/runs/%s" % (e["GITHUB_SERVER_URL"], e["GITHUB_REPOSITORY"], e["GITHUB_RUN_ID"])
+          if errors:
+              res["verdict"] = "invalid_input"
+              res["input_errors"] = errors
+          with open(os.path.join(out, "result.json"), "w", encoding="utf-8") as f:
+              json.dump(res, f, indent=2)
+          for msg in errors:
+              print("::error::" + msg)
+          sys.exit(1 if errors else 0)
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.base }}
+          persist-credentials: false
+
+      - name: apply
+        shell: python -I {0}
+        run: |
+          import hashlib, json, os, re, subprocess, sys
+          sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+          out = os.path.join(os.environ["RUNNER_TEMP"], "cand")
+          path = os.path.join(out, "result.json")
+          res = json.load(open(path, encoding="utf-8"))
+          log = open(os.path.join(out, "apply.log"), "w", encoding="utf-8")
+
+          def git(*args, check=False):
+              p = subprocess.run(["git", "-c", "core.quotepath=off", *args], capture_output=True,
+                                 text=True, encoding="utf-8", errors="replace",
+                                 env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_EDITOR": "true"})
+              text = "$ git %s\n%s%s[exit %d]\n" % (" ".join(args), p.stdout, p.stderr, p.returncode)
+              log.write(text)
+              print(text, end="", flush=True)
+              if check and p.returncode:
+                  raise RuntimeError("git %s: %s" % (args[0], (p.stderr or p.stdout).strip()[-600:]))
+              return p
+
+          def save():
+              with open(path, "w", encoding="utf-8") as f:
+                  json.dump(res, f, indent=2)
+
+          apply = res["apply"] = {"status": "ok", "applied": [], "empty": [], "failed_commit": None,
+                                  "conflicts": [], "docs_conflicts_ignored": [], "sensitive_files": []}
+          try:
+              res["base_sha"] = res["head_sha"] = git("rev-parse", "HEAD", check=True).stdout.strip()
+              # Identifies the base's code: workflow and baseline commits under .github/ do not change it.
+              tree = git("ls-tree", "HEAD", check=True).stdout.splitlines()
+              code = "\n".join(l for l in tree if not l.endswith("\t.github"))
+              res["base_code"] = hashlib.sha1(code.encode()).hexdigest()
+              save()
+              git("config", "user.name", "candidate-ci", check=True)
+              git("config", "user.email", "candidate-ci@users.noreply.github.com", check=True)
+              commits = res["commits"]
+              if commits:
+                  url = "https://github.com/%s" % res["repo"]
+                  if any(len(c) < 40 for c in commits):
+                      # A short SHA cannot be fetched by name: take every branch and PR head.
+                      git("fetch", "--no-tags", "--quiet", url,
+                          "+refs/heads/*:refs/cand/heads/*", "+refs/pull/*/head:refs/cand/pull/*", check=True)
+                  full = [c for c in commits if len(c) == 40]
+                  if full:
+                      git("fetch", "--no-tags", "--quiet", "--depth=2", url, *full, check=True)
+              for sha in commits:
+                  apply["failed_commit"] = sha
+                  full = git("rev-parse", "--verify", sha + "^{commit}", check=True).stdout.strip()
+                  header = git("cat-file", "-p", full, check=True).stdout.split("\n\n", 1)[0]
+                  parents = [l.split()[1] for l in header.splitlines() if l.startswith("parent ")]
+                  if parents and git("cat-file", "-e", parents[0] + "^{tree}").returncode:
+                      git("fetch", "--no-tags", "--quiet", "--depth=2",
+                          "https://github.com/%s" % res["repo"], full, check=True)
+                  before = git("rev-parse", "HEAD", check=True).stdout.strip()
+                  args = ["cherry-pick", "-x", "--allow-empty", "--keep-redundant-commits"]
+                  if len(parents) > 1:
+                      args += ["-m", "1"]
+                  p = git(*args, full)
+                  if p.returncode:
+                      bad = [l for l in git("diff", "--name-only", "--diff-filter=U").stdout.splitlines() if l]
+                      if not bad:
+                          raise RuntimeError("cherry-pick failed: " + (p.stderr or p.stdout).strip()[-600:])
+                      if not all(re.search(r"(?i)\.md$|^docs/", f) for f in bad):
+                          apply["status"] = "conflict"
+                          apply["conflicts"] = bad
+                          break
+                      # Only documentation conflicts: keep our side, it changes nothing that is built.
+                      for f in bad:
+                          if git("cat-file", "-e", "HEAD:" + f).returncode == 0:
+                              git("checkout", "HEAD", "--", f, check=True)
+                          else:
+                              git("rm", "-q", "-f", "--", f, check=True)
+                      git("commit", "--allow-empty", "--no-edit", check=True)
+                      apply["docs_conflicts_ignored"] += [f for f in bad if f not in apply["docs_conflicts_ignored"]]
+                  changed = git("diff", "--name-only", before, "HEAD", check=True).stdout.splitlines()
+                  if not changed:
+                      apply["empty"].append(full)
+                  for f in changed:
+                      if re.search(r"(^|/)(build\.rs|Cargo\.toml|Cargo\.lock)$|^\.cargo/|^\.github/|^rust-toolchain", f) \
+                              and f not in apply["sensitive_files"]:
+                          apply["sensitive_files"].append(f)
+                  apply["applied"].append(full)
+                  apply["failed_commit"] = None
+              res["head_sha"] = git("rev-parse", "HEAD", check=True).stdout.strip()
+          except Exception as exc:
+              apply["status"] = "error"
+              apply["error"] = str(exc)
+          if apply["status"] != "ok":
+              res["verdict"] = "apply_" + apply["status"]
+              git("cherry-pick", "--abort")
+          save()
+          if apply["status"] == "conflict":
+              print("::error::conflict on %s: %s" % (apply["failed_commit"], ", ".join(apply["conflicts"])))
+          elif apply["status"] == "error":
+              print("::error::apply failed: " + apply["error"].replace("\n", " "))
+          sys.exit(0 if apply["status"] == "ok" else 1)
+
+      - name: Rust toolchain
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: candidate
+          # Only reference runs write the cache, so candidate code cannot poison it for others.
+          save-if: ${{ inputs.commits == '' }}
+          cache-on-failure: true
+
+      - name: build
+        timeout-minutes: 50
+        shell: python -I {0}
+        run: |
+          import json, os, re, subprocess, sys, time
+          sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+          out = os.path.join(os.environ["RUNNER_TEMP"], "cand")
+          path = os.path.join(out, "result.json")
+          res = json.load(open(path, encoding="utf-8"))
+          start = time.time()
+          lines = []
+          p = subprocess.Popen(["cargo", "build", "--workspace", "--locked"], stdout=subprocess.PIPE,
+                               stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
+          with open(os.path.join(out, "build.log"), "w", encoding="utf-8") as log:
+              for line in p.stdout:
+                  log.write(line)
+                  print(line, end="", flush=True)
+                  lines.append(line.rstrip("\n"))
+          code = p.wait()
+          errors, keep = [], 0
+          for line in lines:
+              if re.match(r"error(\[E\d+\])?:", line):
+                  keep = 8
+              if keep and len(errors) < 80:
+                  errors.append(line)
+                  keep -= 1
+          res = json.load(open(path, encoding="utf-8"))
+          res["build"] = {"status": "ok" if code == 0 else "failed", "exit_code": code,
+                          "seconds": round(time.time() - start), "errors": errors if code else []}
+          if code:
+              res["verdict"] = "build_failed"
+          with open(path, "w", encoding="utf-8") as f:
+              json.dump(res, f, indent=2)
+          sys.exit(0 if code == 0 else 1)
+
+      - name: test
+        timeout-minutes: 55
+        shell: python -I {0}
+        run: |
+          import concurrent.futures, json, os, re, subprocess, sys, threading, time, urllib.request
+          sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+          out = os.path.join(os.environ["RUNNER_TEMP"], "cand")
+          path = os.path.join(out, "result.json")
+          start = time.time()
+          cmd = ["cargo", "test", "--workspace", "--locked", "--no-fail-fast", "--",
+                 "--test-threads=4", "--show-output"]
+          p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                               text=True, encoding="utf-8", errors="replace")
+          timed_out = []
+
+          def kill():
+              timed_out.append(True)
+              subprocess.run(["taskkill", "/T", "/F", "/PID", str(p.pid)])
+
+          timer = threading.Timer(48 * 60, kill)
+          timer.start()
+          failed, skipped, excerpts, slow, crashed = [], {}, {}, [], []
+          totals = {"passed": 0, "failed": 0, "ignored": 0}
+          target, open_target, section, block, compile_errors = None, False, None, None, []
+          binaries = {}
+
+          def add(name):
+              full = "%s::%s" % (target, re.sub(r" - should panic$", "", name))
+              if full not in failed:
+                  failed.append(full)
+
+          def close():
+              if open_target:
+                  crashed.append({"target": target, "detail": ""})
+
+          with open(os.path.join(out, "test.log"), "w", encoding="utf-8") as log:
+              for raw in p.stdout:
+                  log.write(raw)
+                  print(raw, end="", flush=True)
+                  line = raw.rstrip("\r\n")
+                  m = re.match(r"\s*Running (?:unittests )?(\S+) \((.+)\)$", line)
+                  d = re.match(r"\s*Doc-tests (\S+)", line)
+                  if m or d:
+                      close()
+                      if m:
+                          stem = re.sub(r"-[0-9a-f]{16}(\.exe)?$", "", re.split(r"[\\/]", m.group(2))[-1])
+                          src = m.group(1).replace("\\", "/")
+                          target = "%s[%s]" % (stem, src)
+                          binaries[target] = (m.group(2), stem, src)
+                      else:
+                          target = "doc:" + d.group(1)
+                      open_target, section, block = True, None, None
+                      continue
+                  if re.match(r"error(\[E\d+\])?:", line) and len(compile_errors) < 40:
+                      compile_errors.append(line)
+                  if "process didn't exit successfully" in line:
+                      # cargo prints this after a binary that died or failed.
+                      if open_target:
+                          crashed.append({"target": target, "detail": line.strip()[-300:]})
+                          open_target = False
+                      elif crashed and crashed[-1]["target"] == target:
+                          crashed[-1]["detail"] = line.strip()[-300:]
+                      continue
+                  r = re.match(r"test result: \w+\. (\d+) passed; (\d+) failed; (\d+) ignored; "
+                               r"\d+ measured; (\d+) filtered out", line)
+                  if r:
+                      # Nothing is filtered here, so a filtered run is a test re-running its own binary.
+                      if r.group(4) == "0":
+                          for k, v in zip(("passed", "failed", "ignored"), r.groups()):
+                              totals[k] += int(v)
+                          open_target, section, block = False, None, None
+                      continue
+                  s = re.search(r"test (\S+) has been running for over", line)
+                  if s:
+                      slow.append("%s::%s" % (target, s.group(1)))
+                      continue
+                  t = re.match(r"test (.+?) \.\.\. FAILED", line)
+                  if t:
+                      add(t.group(1))
+                      continue
+                  if line in ("successes:", "failures:"):
+                      section, block = line[:-1], None
+                      continue
+                  h = re.match(r"---- (.+?) stdout ----$", line)
+                  if h and section:
+                      block = "%s::%s" % (target, h.group(1))
+                      if section == "failures":
+                          add(h.group(1))
+                          excerpts[block] = []
+                      continue
+                  if section and re.match(r"    \S", line) and block is None:
+                      if section == "failures":
+                          add(line.strip())
+                      continue
+                  if block and line:
+                      if section == "successes" and re.search(r"(?i)\bskipp(ed|ing)\b", line):
+                          skipped.setdefault(block, line.strip()[:200])
+                      elif section == "failures" and len(excerpts.get(block, [])) < 12:
+                          excerpts.setdefault(block, []).append(line[:300])
+          code = p.wait()
+          timer.cancel()
+          close()
+
+          # A binary that dies takes the rest of its tests with it: run each of them in its own process.
+          def isolate(entry):
+              name = entry["target"]
+              exe, stem, src = binaries[name]
+              exe = os.path.abspath(exe)
+              meta = json.loads(subprocess.run(
+                  ["cargo", "metadata", "--no-deps", "--locked", "--format-version", "1"],
+                  capture_output=True, text=True, encoding="utf-8", check=True).stdout)
+              cwd = next((os.path.dirname(pkg["manifest_path"]) for pkg in meta["packages"] for t in pkg["targets"]
+                          if t["name"].replace("-", "_") == stem.replace("-", "_")
+                          and t["src_path"].replace("\\", "/").endswith("/" + src)), os.getcwd())
+              env = {**os.environ, "CARGO_MANIFEST_DIR": cwd}
+
+              def listing(*extra):
+                  q = subprocess.run([exe, "--list", "--format", "terse", *extra], cwd=cwd, env=env,
+                                     capture_output=True, text=True, encoding="utf-8", errors="replace",
+                                     timeout=120, check=True)
+                  return [l[:-len(": test")] for l in q.stdout.splitlines() if l.endswith(": test")]
+
+              ignored = set(listing("--ignored"))
+              tests = [t for t in listing() if t not in ignored]
+
+              def one(test):
+                  if time.time() > start + 50 * 60:
+                      return test, "not_run", ""
+                  try:
+                      q = subprocess.run([exe, test, "--exact", "--test-threads=1", "--show-output"], cwd=cwd,
+                                         env=env, capture_output=True, text=True, encoding="utf-8",
+                                         errors="replace", timeout=180)
+                  except subprocess.TimeoutExpired:
+                      return test, "timeout", "no result after 180 s"
+                  text = q.stdout + q.stderr
+                  if q.returncode == 0:
+                      return test, "ok", text
+                  if q.returncode == 101:
+                      return test, "failed", text
+                  return test, "crashed", "exit code 0x%08x\n%s" % (q.returncode & 0xffffffff, text)
+
+              with concurrent.futures.ThreadPoolExecutor(4) as pool:
+                  outcomes = list(pool.map(one, tests))
+              prefix = name + "::"
+              failed[:] = [f for f in failed if not f.startswith(prefix)]
+              for table in (excerpts, skipped):
+                  for key in [k for k in table if k.startswith(prefix)]:
+                      del table[key]
+              count = {"passed": 0, "failed": 0, "ignored": len(ignored), "not_run": 0}
+              entry["crashed_tests"] = []
+              with open(os.path.join(out, "test.log"), "a", encoding="utf-8") as log:
+                  for test, state, text in outcomes:
+                      full = prefix + test
+                      line = "isolated %s ... %s" % (full, state)
+                      print(line, flush=True)
+                      log.write(line + "\n")
+                      if state == "ok":
+                          count["passed"] += 1
+                          own = text.partition("---- %s stdout ----" % test)[2].partition("successes:")[0]
+                          for l in own.splitlines():
+                              if re.search(r"(?i)\bskipp(ed|ing)\b", l):
+                                  skipped[full] = l.strip()[:200]
+                                  break
+                      elif state == "not_run":
+                          count["not_run"] += 1
+                      else:
+                          count["failed"] += 1
+                          failed.append(full)
+                          log.write(text + "\n")
+                          before, header, after = text.partition("---- %s stdout ----" % test)
+                          kept = [l[:300] for l in (after if header else before).splitlines()
+                                  if l and not l.startswith("running ")]
+                          excerpts[full] = ([text.splitlines()[0]] if state == "crashed" else []) + kept[:12]
+                          if state != "failed":
+                              entry["crashed_tests"].append("%s (%s)" % (test, state))
+              entry["isolated"] = count
+              for k in ("passed", "failed", "ignored"):
+                  totals[k] += count[k]
+              if count["not_run"]:
+                  timed_out.append(True)
+
+          if not timed_out:
+              for entry in crashed:
+                  if entry["target"] in binaries:
+                      try:
+                          isolate(entry)
+                      except Exception as exc:
+                          entry["isolation_error"] = str(exc)[:300]
+                          print("::warning::could not isolate %s: %s" % (entry["target"], exc))
+          res = json.load(open(path, encoding="utf-8"))
+          ran = totals["passed"] + totals["failed"] + totals["ignored"]
+          if timed_out:
+              status = "timeout"
+          elif code == 0:
+              status = "ok"
+          elif ran == 0 and not failed:
+              status = "compile_failed"
+          else:
+              status = "failed"
+          tests = res["tests"] = {
+              "status": status, "exit_code": code, "seconds": round(time.time() - start), **totals,
+              "failed_tests": sorted(failed), "crashed_targets": crashed,
+              "skipped_at_runtime": dict(sorted(skipped.items())), "slow_tests": slow,
+              "compile_errors": compile_errors if status == "compile_failed" else [],
+              "failure_excerpts": excerpts,
+          }
+
+          # Compare with the recorded reference of the same base, if there is one.
+          comparison = None
+          url = "https://raw.githubusercontent.com/%s/%s/.github/candidate-baseline.json" % (
+              os.environ["GITHUB_REPOSITORY"], os.environ["GITHUB_SHA"])
+          try:
+              with urllib.request.urlopen(url, timeout=30) as r:
+                  ref = json.load(r).get("bases", {}).get(res["base"])
+          except Exception as exc:
+              ref = None
+              print("no baseline: %s" % exc)
+          if ref:
+              old_failed = set(ref.get("failed_tests", []))
+              old_crashed = set(ref.get("crashed_targets", []))
+              new_crashed = sorted({c["target"] for c in crashed} - old_crashed)
+              comparison = {
+                  "reference_run": ref.get("run_url"), "reference_base_sha": ref.get("base_sha"),
+                  "stale": ref.get("base_code") != res.get("base_code"),
+                  "new_failures": sorted(set(failed) - old_failed),
+                  "new_crashed_targets": new_crashed,
+                  "known_failures": sorted(set(failed) & old_failed),
+                  "fixed": sorted(old_failed - set(failed)),
+                  "passed_delta": totals["passed"] - ref.get("passed", 0),
+              }
+          tests["comparison"] = comparison
+          if status in ("timeout", "compile_failed"):
+              verdict = "tests_" + status
+          elif comparison:
+              if comparison["new_failures"]:
+                  verdict = "new_failures"
+              elif comparison["new_crashed_targets"]:
+                  verdict = "new_crash"
+              elif status != "ok" and not (failed or crashed):
+                  verdict = "tests_failed"
+              else:
+                  verdict = "pass"
+          else:
+              verdict = "pass" if status == "ok" else "tests_failed"
+          res["verdict"] = verdict
+          with open(path, "w", encoding="utf-8") as f:
+              json.dump(res, f, indent=2)
+          print("verdict: " + verdict)
+          sys.exit(0 if verdict == "pass" else 1)
+
+      - name: report
+        if: ${{ always() }}
+        shell: python -I {0}
+        run: |
+          import json, os
+          out = os.path.join(os.environ["RUNNER_TEMP"], "cand")
+          path = os.path.join(out, "result.json")
+          if not os.path.exists(path):
+              raise SystemExit(0)
+          res = json.load(open(path, encoding="utf-8"))
+          if not res.get("verdict"):
+              res["verdict"] = "infra_error"
+              with open(path, "w", encoding="utf-8") as f:
+                  json.dump(res, f, indent=2)
+          a, b, t = res["apply"], res["build"], res["tests"]
+          md = ["## cand %s: %s" % (res["id"] if res["verdict"] != "invalid_input" else "?", res["verdict"]), ""]
+          if res["verdict"] == "invalid_input":
+              md += ["- " + e for e in res["input_errors"]]
+          else:
+              md += ["- source: `%s`, commits: %s" % (res["repo"], " ".join("`%s`" % c[:10] for c in res["commits"]) or "none (reference)"),
+                     "- base: `%s` @ `%s`, head: `%s`" % (res["base"], res["base_sha"], res["head_sha"]),
+                     "- apply: **%s**" % a["status"], "- build: **%s**" % b["status"], "- tests: **%s**" % t["status"]]
+
+          def block(title, items, limit=200):
+              if items:
+                  md.extend(["", "### %s (%d)" % (title, len(items)), "```"] + list(items)[:limit] + ["```"])
+
+          if a.get("failed_commit"):
+              md.append("- failed commit: `%s`" % a["failed_commit"])
+          if a.get("error"):
+              block("Apply error", a["error"].splitlines())
+          block("Conflicting files", a.get("conflicts"))
+          block("Documentation conflicts ignored (our side kept)", a.get("docs_conflicts_ignored"))
+          block("Already present (empty after cherry-pick)", a.get("empty"))
+          block("Sensitive files touched, review them", a.get("sensitive_files"))
+          block("Build errors", b.get("errors"))
+          if "passed" in t:
+              md += ["", "passed %d, failed %d, ignored %d, skipped at runtime %d, crashed targets %d" % (
+                  t["passed"], t["failed"], t["ignored"], len(t["skipped_at_runtime"]), len(t["crashed_targets"]))]
+              c = t.get("comparison")
+              if c:
+                  md.append("compared with %s%s: passed delta %+d" % (
+                      c["reference_run"], " (STALE: base moved)" if c["stale"] else "", c["passed_delta"]))
+                  block("NEW failures", c["new_failures"])
+                  block("NEW crashed targets", c["new_crashed_targets"])
+                  block("Fixed", c["fixed"])
+              else:
+                  md.append("no recorded reference for this base: compare with your own reference run")
+              block("Failed tests", t["failed_tests"])
+              block("Crashed targets (rerun test by test)", ["%s %s | isolated: %s | crashing alone: %s" % (
+                  x["target"], x["detail"], x.get("isolated", x.get("isolation_error", "not rerun")),
+                  ", ".join(x.get("crashed_tests", [])) or "none") for x in t["crashed_targets"]])
+              block("Skipped at runtime (GPU, compiler)", ["%s: %s" % kv for kv in t["skipped_at_runtime"].items()])
+              block("Test compile errors", t["compile_errors"])
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as f:
+              f.write("\n".join(md) + "\n")
+          print("\n".join(md).encode("ascii", "replace").decode())
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ always() }}
+        with:
+          name: result
+          path: ${{ runner.temp }}/cand/
+          if-no-files-found: warn
+          retention-days: 30

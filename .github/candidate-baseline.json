@@ -1,0 +1,61 @@
+{
+  "bases": {
+    "main": {
+      "run_url": "https://github.com/Revens2/VItoriaBr/actions/runs/45614163800",
+      "runs": [
+        "https://github.com/Revens2/VItoriaBr/actions/runs/45613607281",
+        "https://github.com/Revens2/VItoriaBr/actions/runs/45614163800"
+      ],
+      "base_sha": "6bf5b5eda1c72653fe2ae264e29298a9af3b641b",
+      "base_code": "f85f232acf7c058a53002e03c2f04a68a29c7136",
+      "passed": 552,
+      "failed": 2,
+      "ignored": 10,
+      "failed_tests": [
+        "victory_gpu[src/lib.rs]::descriptor::host::tests::dynamic_allocation_finds_contiguous_range_crossing_search_cursor",
+        "victory_gpu[src/lib.rs]::pipeline::host::tests::depth_bounds_pipeline_loads_and_filters_draws"
+      ],
+      "crashed_targets": [
+        "victory_gpu[src/lib.rs]"
+      ],
+      "skipped_at_runtime": [
+        "victory_shader[src/lib.rs]::emit::diff_tests::float_semantics_are_the_consoles",
+        "victory_shader[src/lib.rs]::emit::diff_tests::translated_compute_matches_pc",
+        "victory_shader[src/lib.rs]::emit::diff_tests::translated_mesh_shaders_draw_as_pc_ones",
+        "victory_shader[src/lib.rs]::emit::diff_tests::translated_shaders_draw_as_pc_ones",
+        "victory_shader[src/lib.rs]::emit::intersect_tests::the_32_bit_node_test_in_a_host_buffer_matches_the_reference_on_the_card",
+        "victory_shader[src/lib.rs]::emit::intersect_tests::the_32_bit_node_test_over_title_memory_matches_the_reference_on_the_card",
+        "victory_shader[src/lib.rs]::emit::intersect_tests::the_64_bit_node_test_in_a_host_buffer_matches_the_reference_on_the_card",
+        "victory_shader[src/lib.rs]::emit::intersect_tests::the_64_bit_node_test_over_title_memory_matches_the_reference_on_the_card",
+        "victory_shader[src/lib.rs]::emit::rect::tests::rectangles_are_drawn_whole",
+        "victory_shader[src/lib.rs]::emit::tests::stub_pipeline_is_created",
+        "victory_shader[src/lib.rs]::emit::valu_tests::bfe_signed_and_unsigned_match_rdna2",
+        "victory_shader[src/lib.rs]::emit::valu_tests::cvt_16bit_int_from_f16_saturates_and_honors_modifiers",
+        "victory_shader[src/lib.rs]::emit::valu_tests::ds_min_max_f32_are_atomic_across_waves",
+        "victory_shader[src/lib.rs]::emit::valu_tests::ds_min_max_f32_order_floats_and_return_the_old_value",
+        "victory_shader[src/lib.rs]::emit::valu_tests::f16_omod_applies_before_clamp",
+        "victory_shader[src/lib.rs]::emit::valu_tests::max_and_min_order_negative_zero_below_positive_zero",
+        "victory_shader[src/lib.rs]::emit::valu_tests::packed_add_selects_halves_of_inline_constants",
+        "victory_shader[src/lib.rs]::emit::valu_tests::packed_dot_products_and_clamps_execute_cleanly",
+        "victory_shader[src/lib.rs]::emit::valu_tests::v_cmp_class_f16_matches_rdna2",
+        "victory_shader[src/lib.rs]::emit::valu_tests::v_cmp_lg_is_false_for_nan",
+        "victory_shader[src/lib.rs]::emit::valu_tests::v_cvt_f32_f64_matches_ieee754",
+        "victory_shader[src/lib.rs]::emit::valu_tests::v_cvt_norm_i16_and_u16_f16_round_the_exact_product",
+        "victory_shader[src/lib.rs]::emit::valu_tests::v_cvt_u16_and_i16_f16_saturate",
+        "victory_shader[src/lib.rs]::emit::valu_tests::v_fract_f16_never_returns_one",
+        "victory_shader[src/lib.rs]::emit::valu_tests::v_fract_f32_never_returns_one",
+        "victory_shader[src/lib.rs]::emit::valu_tests::v_med3_f16_matches_rdna2_with_nan",
+        "victory_shader[src/lib.rs]::emit::valu_tests::v_med3_f32_matches_rdna2_with_nan",
+        "victory_shader[src/lib.rs]::emit::valu_tests::v_permlane16_and_x16_read_the_lanes_their_selectors_pick",
+        "victory_shader[src/lib.rs]::emit::valu_tests::v_sin_and_v_cos_f16_reduce_large_turns",
+        "victory_shader[src/lib.rs]::emit::valu_tests::v_sin_and_v_cos_f32_reduce_large_turns",
+        "victory_shader[src/lib.rs]::emit::valu_tests::whole_wave_f64_sum_and_cvt_f32_f64",
+        "victory_shader[src/lib.rs]::emit::waterfall_tests::lanes_load_from_the_buffer_their_nested_arms_chose",
+        "victory_shader[src/lib.rs]::emit::waterfall_tests::lanes_sample_the_entry_their_offset_names_in_the_console_waterfall",
+        "victory_shader[src/lib.rs]::emit::waterfall_tests::lanes_sample_the_texture_their_arm_loaded_or_picked",
+        "victory_shader[src/lib.rs]::emit::waterfall_tests::lanes_sample_the_texture_their_if_else_arm_chose",
+        "victory_shader[src/lib.rs]::emit::waterfall_tests::lanes_sample_their_own_texture_in_a_waterfall_narrowed_by_v_cmpx"
+      ]
+    }
+  }
+}
