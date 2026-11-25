@@ -540,11 +540,22 @@ pub(crate) fn pipeline(
         }
         Err(e) => e,
     };
-    // Compiled outside any lock: compiles take up to seconds.
-    let pso = {
+    // Compiled outside any lock: compiles take up to seconds. A second
+    // request for the same name while the first compiles waits for it
+    // (`VICTORY_PSO_SHARE=1`, after Zettrox/ztrx#25's note that misses of
+    // one description could compile twice) instead of compiling again.
+    let shared = share_on().then(|| inflight::begin(name));
+    if let Some(inflight::Turn::Wait(slot)) = &shared {
+        return inflight::wait(slot);
+    }
+    let made = {
         let _call = call("make", name);
-        create()?
+        create()
     };
+    if let Some(inflight::Turn::Make(slot)) = &shared {
+        inflight::finish(name, slot, &made);
+    }
+    let pso = made?;
     MADE.fetch_add(1, Ordering::Relaxed);
     crate::host::trail(|| {
         let label = LABEL.with(|l| l.borrow().clone());
@@ -610,7 +621,10 @@ pub(crate) fn save(now: bool) {
             size
         }
     };
-    let used: Vec<String> = USED.lock().unwrap_or_else(|e| e.into_inner()).iter().flatten().cloned().collect();
+    // With what earlier runs listed: a run that asks for no title pipeline
+    // (`victory warm`) wrote an empty list over theirs, and the next world
+    // began with every pipeline still to be asked for.
+    let used: Vec<String> = used().iter().flatten().cloned().collect();
     let library_written = if bytes > 0 { replace_library(dir, &tmp) } else { Ok(()) };
     if bytes > 0 && library_written.is_ok() {
         // In place unless the system refused and the new one waits beside it.
@@ -837,5 +851,61 @@ mod tests {
             pattern(page * 4096, &mut expected);
             assert!(bytes == &expected[..], "page {page} of the replaced library no longer reads as the old file");
         }
+    }
+}
+
+/// `VICTORY_PSO_SHARE=1`: concurrent misses of one library name share one compile.
+fn share_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PSO_SHARE").is_some_and(|v| v == "1"))
+}
+
+/// Compiles under way, by library name, that other requests may wait for.
+mod inflight {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Condvar, Mutex};
+    use windows::Win32::Graphics::Direct3D12::ID3D12PipelineState;
+
+    type Made = windows::core::Result<ID3D12PipelineState>;
+    pub(super) type Slot = Arc<(Mutex<Option<Made>>, Condvar)>;
+
+    pub(super) enum Turn {
+        Make(Slot),
+        Wait(Slot),
+    }
+
+    static ALL: Mutex<Option<HashMap<String, Slot>>> = Mutex::new(None);
+    /// Compiles another request's compile spared.
+    static SPARED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    pub(super) fn begin(name: &str) -> Turn {
+        let mut all = ALL.lock().unwrap_or_else(|e| e.into_inner());
+        let all = all.get_or_insert_with(HashMap::new);
+        if let Some(slot) = all.get(name) {
+            let n = SPARED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
+                tracing::info!(n, "pipeline library: compiles spared by waiting for the same one under way");
+            }
+            return Turn::Wait(slot.clone());
+        }
+        let slot: Slot = Arc::new((Mutex::new(None), Condvar::new()));
+        all.insert(name.to_owned(), slot.clone());
+        Turn::Make(slot)
+    }
+
+    pub(super) fn finish(name: &str, slot: &Slot, made: &Made) {
+        *slot.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(made.clone());
+        slot.1.notify_all();
+        if let Some(all) = ALL.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            all.remove(name);
+        }
+    }
+
+    pub(super) fn wait(slot: &Slot) -> Made {
+        let mut done = slot.0.lock().unwrap_or_else(|e| e.into_inner());
+        while done.is_none() {
+            done = slot.1.wait(done).unwrap_or_else(|e| e.into_inner());
+        }
+        done.clone().expect("set above")
     }
 }

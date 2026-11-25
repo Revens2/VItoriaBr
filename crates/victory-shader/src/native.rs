@@ -58,10 +58,13 @@
 //!             u16 maximum primitives, u8 user SGPRs, u8 output topology
 //!             (2 triangles); code follows at E+0x45c
 //! record +0x4c u32 LDS bytes (`lds_byte_size`; mesh programs read it here)
+//! GS  E+0x27c u32 output dwords per invocation, u32 (1 seen), u32 maximum
+//!             output vertices, u32 0, u32 dwords per output vertex
+//!             (the first is the product of the other two; checked)
 //! ```
 //!
 //! Rows are registers of the container's signature parts (`ISG1`, `OSG1`).
-//! Merged stages keep their stage data in another layout (not read).
+//! Other merged stages keep their stage data in another layout (not read).
 //!
 //! Other kinds seen: 0x07 program header + bitcode (or a stub when stripped),
 //! 0x0a `xbop` (compiler options), 0x0e a table not decoded yet, 0x10 and
@@ -120,6 +123,9 @@ const CS_THREADS: usize = 0x28;
 const RECORD_LDS: usize = 0x4c;
 const MS_CLIP_CNTL: usize = 0x194;
 const MS_INFO: usize = 0x448;
+const GS_RING: usize = 0x27c;
+/// Output vertices a D3D geometry shader may declare.
+const GS_MAX_VERTICES: u32 = 1024;
 /// Unpacked blobs are a few KiB; refuse to allocate for absurd sizes.
 const MAX_UNPACKED: u64 = 16 << 20;
 
@@ -268,6 +274,18 @@ pub enum StageIo {
     },
     Cs(ComputeIo),
     Ms(MeshIo),
+    Gs(GeometryIo),
+}
+
+/// A geometry program's output layout (the half of a merged ES-GS stage
+/// after the handover). Each invocation writes its output vertices to LDS,
+/// vertex k at `k * vertex_dwords` dwords from its base, dword `4 r + c`
+/// of a vertex being component c of output register r, and sends a GS emit
+/// message after each vertex.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GeometryIo {
+    pub max_vertices: u32,
+    pub vertex_dwords: u32,
 }
 
 /// A mesh program's outputs and limits. It runs as one hardware NGG stage:
@@ -587,6 +605,7 @@ fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
                 ],
             }),
             HwStage::Ms => ms_io(stage_data, u32_at(record, RECORD_LDS)?)?,
+            HwStage::Gs => gs_io(stage_data).map_or(StageIo::None, StageIo::Gs),
             _ => StageIo::None,
         };
         out.push(NativeProgram {
@@ -704,6 +723,21 @@ fn ms_io(data: &[u8], lds_bytes: u32) -> Result<StageIo, ShaderError> {
         topology: info[7],
         lds_bytes,
     }))
+}
+
+/// A geometry program's output layout, if its stage data holds a
+/// consistent one (none: its I/O is not raised).
+fn gs_io(data: &[u8]) -> Option<GeometryIo> {
+    let word = |k: usize| u32_at(data, GS_RING + 4 * k).ok();
+    let (per_invocation, max_vertices, vertex_dwords) = (word(0)?, word(2)?, word(4)?);
+    let plausible = (1..=GS_MAX_VERTICES).contains(&max_vertices)
+        && (1..=128).contains(&vertex_dwords)
+        && vertex_dwords % 4 == 0
+        && max_vertices.checked_mul(vertex_dwords) == Some(per_invocation);
+    plausible.then_some(GeometryIo {
+        max_vertices,
+        vertex_dwords,
+    })
 }
 
 /// For entries already sized by `as_chunks`.
@@ -988,6 +1022,28 @@ mod tests {
                 lds_bytes: 16,
             })
         );
+    }
+
+    #[test]
+    fn reads_the_geometry_output_layout() {
+        let mut blob = fssm(&[(HwStage::Gs, &VS_CODE)]);
+        let e = stage_data_at(&blob, HwStage::Gs);
+        // 60 dwords per invocation: 3 vertices of 20 (as the voxelizer's).
+        for (k, v) in [0x3cu32, 1, 3, 0, 0x14].into_iter().enumerate() {
+            blob[e + GS_RING + 4 * k..][..4].copy_from_slice(&v.to_le_bytes());
+        }
+        let p = &native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))])).unwrap()[0];
+        assert_eq!(
+            p.io,
+            StageIo::Gs(GeometryIo {
+                max_vertices: 3,
+                vertex_dwords: 20
+            })
+        );
+        // A product that disagrees: no layout.
+        blob[e + GS_RING..][..4].copy_from_slice(&0x3du32.to_le_bytes());
+        let p = &native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))])).unwrap()[0];
+        assert_eq!(p.io, StageIo::None);
     }
 
     #[test]

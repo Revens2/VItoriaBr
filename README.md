@@ -7,6 +7,8 @@ Camada nativa de execução em Windows para **um título Xbox Series X|S**, roda
 O código x86-64 original do título executa inalterado dentro do nosso processo; o **VItoriaBr** fornece a plataforma Xbox/GDK por baixo e traduz os dados e shaders do console (D3D12.X / GFX10 → D3D12 / DXIL). Veja [docs/architecture.md](docs/architecture.md). Para uma explicação didática, com diagramas, de por que um jogo de Xbox não roda no PC e de como cada parte do projeto resolve isso, veja [docs/visao-geral.md](docs/visao-geral.md).
 
 > **Base e licença:** Fork/continuação baseada no projeto open-source [Marvisak/VIctory](https://github.com/Marvisak/VIctory), com integração das melhorias GPL-3.0 de renderização do mundo 3D, iluminação, relay/VRAM e otimizador DXIL de [fxceless/victory-fork](https://github.com/fxceless/victory-fork), mantido sob a licença **GPL-3.0-or-later** ([LICENSE](LICENSE)). **Este repositório não contém nem distribui nenhum arquivo de jogo** — todos os caminhos de jogo, cache e dados devem ficar fora do repositório ([docs/asset-policy.md](docs/asset-policy.md)).
+>
+> **ScarlettPort:** a tradução de shaders e as correções de velocidade/renderização de [ZigZagBoi1/ScarlettPort](https://github.com/ZigZagBoi1/ScarlettPort) (`runtime/victory`, GPL-3.0-or-later, commit `eed2cb3`) foram integradas aqui. Autores e linhagem: [SCARLETTPORT.md](SCARLETTPORT.md) e [VICKY.md](VICKY.md). Nada de `runtime/xcl` (GPL-2.0-only) foi copiado.
 
 ---
 
@@ -158,6 +160,8 @@ Principais variáveis de ambiente no `diag`:
 The title's x86-64 code runs unchanged inside our process; **VItoriaBr** provides the underlying console platform and translates shaders/resources (D3D12.X / GFX10 → host D3D12 / DXIL). See [docs/architecture.md](docs/architecture.md).
 
 > **Upstream & License:** Derived from [Marvisak/VIctory](https://github.com/Marvisak/VIctory) with GPL-3.0 world-rendering, lighting, relay/VRAM, and DXIL optimizer improvements integrated from [fxceless/victory-fork](https://github.com/fxceless/victory-fork), licensed under **GPL-3.0-or-later** ([LICENSE](LICENSE)). **No game files or derived assets are shipped or allowed in this repository** ([docs/asset-policy.md](docs/asset-policy.md)).
+>
+> **ScarlettPort:** the shader translation and the speed/rendering fixes of [ZigZagBoi1/ScarlettPort](https://github.com/ZigZagBoi1/ScarlettPort) (`runtime/victory`, GPL-3.0-or-later, commit `eed2cb3`) are merged here. Authors and lineage: [SCARLETTPORT.md](SCARLETTPORT.md) and [VICKY.md](VICKY.md). Nothing from `runtime/xcl` (GPL-2.0-only) was copied.
 
 ### Status & Progress (2026-11-25)
 

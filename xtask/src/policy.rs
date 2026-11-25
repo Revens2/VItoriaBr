@@ -10,7 +10,8 @@ use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 
-const MAX_FILE_SIZE: usize = 512 * 1024;
+// (Room for the merged lowering source, `emit/lower.rs`.)
+const MAX_FILE_SIZE: usize = 640 * 1024;
 const MAX_ENCODED_RUN: usize = 512;
 
 const ALLOWED_EXTENSIONS: &[&str] = &[

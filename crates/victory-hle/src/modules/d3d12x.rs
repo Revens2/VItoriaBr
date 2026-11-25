@@ -19,6 +19,11 @@ extern "system" fn create_device(
 ) -> HRESULT {
     victory_gpu::resource::use_allocator(super::xmem::XMemAlloc, super::xmem::XMemFree);
     victory_gpu::resource::use_page_mapper(super::xmem::map_alias);
+    victory_gpu::use_title_memory(super::xmem::title_own_bytes);
+    victory_gpu::use_cpu_free(super::xmem::cpu_free);
+    if super::xmem::pagemap_runs() {
+        victory_gpu::resource::use_page_batch_mapper(super::xmem::map_alias_batch);
+    }
     #[cfg(windows)]
     victory_gpu::on_failure(host_gpu_failed);
     device::create(adapter, parameters, iid, out)
@@ -61,6 +66,16 @@ pub fn use_shader_cache(dir: std::path::PathBuf) {
     #[cfg(not(windows))]
     let _ = dir;
 }
+
+/// The title's shader archive (`shaders.rpf` of the package), which its
+/// precompiled pipelines name their shaders in; indexed in the background,
+/// the index kept at `index` across runs.
+pub fn use_shader_pack(archive: std::path::PathBuf, index: std::path::PathBuf) {
+    victory_gpu::pipeline::use_shader_pack(archive, Some(index));
+}
+
+#[cfg(windows)]
+pub use victory_gpu::pipeline::{precompile_graphics, save_pipeline_cache, warm};
 
 pub(crate) fn module() -> HleModule {
     HleModule {
