@@ -8052,16 +8052,33 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     let moved = std::time::Instant::now();
     // Into host memory: in place first, if asked for (`crate::plaincopy`);
     // through the kernel if that is off or met a page that was not there.
-    let whole = (!title_dst && crate::plaincopy::copy(dst, src, len)) || read(src, dst, len);
-    let whole = if !title_dst && direct_reads() {
-        if direct_read(src, dst, len) {
+    // `VICTORY_COPY_ONCE=0` reads twice, as it was (the first read's result
+    // was dropped; the same bytes were read again below).
+    let whole = if copy_once() {
+        if !title_dst && crate::plaincopy::copy(dst, src, len) {
             true
+        } else if !title_dst && direct_reads() {
+            if direct_read(src, dst, len) {
+                true
+            } else {
+                DIRECT_REFUSED.fetch_add(1, Ordering::Relaxed);
+                read(src, dst, len)
+            }
         } else {
-            DIRECT_REFUSED.fetch_add(1, Ordering::Relaxed);
             read(src, dst, len)
         }
     } else {
-        read(src, dst, len)
+        let _ = (!title_dst && crate::plaincopy::copy(dst, src, len)) || read(src, dst, len);
+        if !title_dst && direct_reads() {
+            if direct_read(src, dst, len) {
+                true
+            } else {
+                DIRECT_REFUSED.fetch_add(1, Ordering::Relaxed);
+                read(src, dst, len)
+            }
+        } else {
+            read(src, dst, len)
+        }
     };
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
@@ -8085,6 +8102,13 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::SparseUs, sparse.elapsed().as_micros() as u64);
+}
+
+/// `VICTORY_COPY_ONCE` (default 1; `0` = as before): [`copy_mapped`] reads
+/// the source into host memory once, not twice.
+fn copy_once() -> bool {
+    static ONCE: OnceLock<bool> = OnceLock::new();
+    *ONCE.get_or_init(|| !std::env::var_os("VICTORY_COPY_ONCE").is_some_and(|v| v == "0"))
 }
 
 /// `VICTORY_COPY_ASK=1`: a copy into title memory asks first whether the
