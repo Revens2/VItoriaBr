@@ -88,7 +88,7 @@ jobs:
       - name: apply
         shell: python -I {0}
         run: |
-          import json, os, re, subprocess, sys
+          import hashlib, json, os, re, subprocess, sys
           sys.stdout.reconfigure(encoding="utf-8", errors="replace")
           out = os.path.join(os.environ["RUNNER_TEMP"], "cand")
           path = os.path.join(out, "result.json")
@@ -114,6 +114,10 @@ jobs:
                                   "conflicts": [], "docs_conflicts_ignored": [], "sensitive_files": []}
           try:
               res["base_sha"] = res["head_sha"] = git("rev-parse", "HEAD", check=True).stdout.strip()
+              # Identifies the base's code: workflow and baseline commits under .github/ do not change it.
+              tree = git("ls-tree", "HEAD", check=True).stdout.splitlines()
+              code = "\n".join(l for l in tree if not l.endswith("\t.github"))
+              res["base_code"] = hashlib.sha1(code.encode()).hexdigest()
               save()
               git("config", "user.name", "candidate-ci", check=True)
               git("config", "user.email", "candidate-ci@users.noreply.github.com", check=True)
@@ -445,7 +449,7 @@ jobs:
               new_crashed = sorted({c["target"] for c in crashed} - old_crashed)
               comparison = {
                   "reference_run": ref.get("run_url"), "reference_base_sha": ref.get("base_sha"),
-                  "stale": ref.get("base_sha") != res["base_sha"],
+                  "stale": ref.get("base_code") != res.get("base_code"),
                   "new_failures": sorted(set(failed) - old_failed),
                   "new_crashed_targets": new_crashed,
                   "known_failures": sorted(set(failed) & old_failed),
