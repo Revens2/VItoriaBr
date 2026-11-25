@@ -190,9 +190,24 @@ fn windows() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_some_and(|v| v == "1")) && !crate::drvwatch::tripped()
 }
 
+/// Where the clamps of a run of indirect draws go (`crate::indirect::hoisting`):
+/// the list `clamps`, open, which runs before the host list recorded into,
+/// as long as that one has run no shader that can write buffers since
+/// (`writes`: a later one may write the arguments), and the waits for
+/// memory values that stand before it. From Belobug/VIctory-Belobug-AMD
+/// `ccab973` (GPL-3.0-or-later), adapted to this tree's cut lists.
+pub(crate) struct Hoist {
+    pub(crate) clamps: HostList,
+    pub(crate) waits: Vec<crate::list::ValueWait>,
+    pub(crate) writes: u64,
+}
+
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
+    /// The list before the host list recorded into that holds the clamps of
+    /// its indirect draws, still open.
+    hoist: Option<Hoist>,
     pipeline: usize,
     /// View heap, sampler heap.
     heaps: [usize; 2],
@@ -696,6 +711,23 @@ impl State {
         crate::draw::depth_bounds(list, min, max);
     }
 
+    /// Whether the clamps of indirect draws recorded in `list` now go to
+    /// the list before it: nothing that can write buffers ran in `list`
+    /// since the hoist was made.
+    pub(crate) fn hoists_into(&self, list: &HostList) -> bool {
+        self.hoist.as_ref().is_some_and(|h| h.writes == list.writes())
+    }
+
+    /// From here on the clamps of `into`'s indirect draws go to `clamps`.
+    pub(crate) fn set_hoist(&mut self, clamps: HostList, waits: Vec<crate::list::ValueWait>, into: &HostList) {
+        self.hoist = Some(Hoist { clamps, waits, writes: into.writes() });
+    }
+
+    /// The list of hoisted clamps, if any, to be ended and closed.
+    pub(crate) fn take_hoist(&mut self) -> Option<Hoist> {
+        self.hoist.take()
+    }
+
     /// `list` is a new host list that continues the title's list (it was
     /// cut at a wait for a memory value, `crate::list::cut`): a new host
     /// list has nothing set, so what the title set so far is set again.
@@ -1001,6 +1033,11 @@ impl State {
         }
         for stage in &p.stages {
             let t = stage.translated();
+            if t.stores {
+                // What may write indirect arguments: ends a run of draws
+                // whose clamps were hoisted (`crate::indirect::hoisting`).
+                list.count_write();
+            }
             STORES.set(t.stores);
             let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
             STORES.set(true);
@@ -3054,8 +3091,30 @@ impl State {
             .filter(|w| same(w) && offset >= w.base)
             .filter(|w| (offset - w.base) % u64::from(w.step) == 0 && (offset - w.base) / u64::from(w.step) < u64::from(w.records))
             .map(|w| (w.scratch.clone(), offset - w.base, w.step));
-        let (bounded, at) = match hit {
-            Some((scratch, at, step)) => {
+        // Clamped in the list before this one, which the run's first draw
+        // opened (`crate::list`), so that nothing of ours comes between the
+        // draws; not when a shader that can write buffers ran since.
+        let hoisted = if hit.is_none() && !windowed && kind != DISPATCH && self.hoists_into(list) {
+            let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
+            self.hoist.as_ref().and_then(|h| {
+                args.refresh(&h.clamps, arguments, len);
+                if let Some((s, at)) = &counter {
+                    s.refresh(&h.clamps, *at, 4);
+                    s.refresh(list, *at, 4);
+                }
+                crate::indirect::bound_before(
+                    &h.clamps,
+                    (&args.buffer, args.offset(arguments)),
+                    count_arg,
+                    (kind, stride, max),
+                )
+            })
+        } else {
+            None
+        };
+        let (bounded, at) = match (hit, hoisted) {
+            (None, Some(b)) => b,
+            (Some((scratch, at, step)), _) => {
                 // Diagnostics of windows: the record clamped again and
                 // compared (`crate::indirect::window_check`).
                 if crate::indirect::window_check()
@@ -3072,7 +3131,7 @@ impl State {
                 }
                 (scratch, at)
             }
-            None => {
+            (None, None) => {
                 // A record a short step after the last window's last one
                 // (the same step as that window's, if it had one): the
                 // title walks the buffer, so the ones that step apart

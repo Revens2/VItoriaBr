@@ -285,6 +285,75 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
     }
 }
 
+/// Ends the hoist of clamps in `list`, if there is one: its clamps list is
+/// closed (the clamped arguments become readable as indirect arguments)
+/// and takes its place among the parts, after what was recorded before it
+/// and before the host list that draws. Called before anything else cuts
+/// or closes the list, so that the order of the parts stays the order of
+/// the recording.
+#[cfg(windows)]
+fn end_hoist(list: &mut List) {
+    let hoist = list.state.get_mut().unwrap_or_else(|e| e.into_inner()).take_hoist();
+    if let Some(h) = hoist {
+        h.clamps.clamp_end();
+        h.clamps.close();
+        list.earlier.push(Part { waits: h.waits, host: h.clamps });
+    }
+}
+
+/// Before an indirect draw (`crate::indirect::hoisting`): unless the clamps
+/// of the list's draws already go to a list before it and nothing since may
+/// have written arguments, the recording is cut here: what was recorded
+/// keeps its place, a list for the clamps of the draws to come follows it,
+/// and the recording goes on in another list after that, with the state the
+/// title set. With no work in the host list so far, it holds the clamps
+/// itself (and the waits that stood before it).
+/// From Belobug/VIctory-Belobug-AMD `ccab973` and `918ab03`
+/// (GPL-3.0-or-later), adapted to the parts of [`cut`].
+#[cfg(windows)]
+fn hoist(this: This) {
+    // Parts are only run by a queue that cuts at waits (`submit_cut`).
+    if this.is_null() || !crate::indirect::hoisting() || !crate::queue::cuts() {
+        return;
+    }
+    // SAFETY: the title passes one of our lists; a list is recorded by one
+    // thread at a time and is not submitted while it records.
+    let list = unsafe { &mut *this.cast_mut().cast::<List>() };
+    let Some(current) = list.host.as_ref() else {
+        return;
+    };
+    if list.state.get_mut().unwrap_or_else(|e| e.into_inner()).hoists_into(current) {
+        return;
+    }
+    end_hoist(list);
+    let worked = list.host.as_ref().is_some_and(|h| !h.untouched());
+    let Some(next) = fresh_list() else {
+        return;
+    };
+    let (clamps, waits) = if worked {
+        let Some(clamps) = fresh_list() else {
+            return;
+        };
+        let Some(old) = list.host.replace(next) else {
+            return;
+        };
+        old.close();
+        let waits = std::mem::take(&mut list.gate);
+        list.earlier.push(Part { waits, host: old });
+        (clamps, Vec::new())
+    } else {
+        let Some(old) = list.host.replace(next) else {
+            return;
+        };
+        (old, std::mem::take(&mut list.gate))
+    };
+    if let Some(host) = list.host.as_ref() {
+        let state = list.state.get_mut().unwrap_or_else(|e| e.into_inner());
+        state.replay(host);
+        state.set_hoist(clamps, waits, host);
+    }
+}
+
 /// A wait for a memory value recorded into list `this`, with waits cut
 /// into lists (`crate::queue::cuts`). On the console the queue runs the
 /// list up to the wait, stands there until the value is in memory, and
@@ -310,6 +379,8 @@ fn cut(this: This, wait: ValueWait) {
     // SAFETY: the title passes one of our lists; a list is recorded by one
     // thread at a time and is not submitted while it records.
     let list = unsafe { &mut *this.cast_mut().cast::<List>() };
+    // Clamps hoisted before the wait stay before it.
+    end_hoist(list);
     let Some(current) = list.host.as_ref() else {
         return;
     };
@@ -625,6 +696,11 @@ extern "system" fn list_type(this: This) -> u32 {
     unsafe { (*this.cast::<List>()).kind }
 }
 extern "system" fn close(this: This) -> HRESULT {
+    #[cfg(windows)]
+    if !this.is_null() {
+        // SAFETY: the title passes one of our lists, which it closes.
+        end_hoist(unsafe { &mut *this.cast_mut().cast::<List>() });
+    }
     #[cfg(windows)]
     if let Some(host) = host_list(this) {
         host.close();
@@ -1760,6 +1836,9 @@ extern "system" fn execute_indirect(
         const DISPATCH: u32 = 2;
         const DISPATCH_SINGLE: u32 = 105;
         let kind = if *kind == DISPATCH_SINGLE { DISPATCH } else { *kind };
+        if kind != DISPATCH {
+            hoist(this);
+        }
         with_state(this, |list, s| {
             ran = s.execute_indirect(list, (kind, stride, max), address, counter);
         });
@@ -2069,6 +2148,7 @@ fn value_written(this: This, address: u64, value: u64) {
         // SAFETY: the title passes one of our lists; a list is recorded by
         // one thread at a time and is not submitted while it records.
         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
+        end_hoist(list);
         let Some(current) = list.host.as_ref() else {
             return;
         };

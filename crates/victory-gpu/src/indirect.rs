@@ -493,6 +493,100 @@ fn record_clamp_as(
     true
 }
 
+/// How the clamps of indirect draws are recorded (`VICTORY_HOIST_CLAMPS`):
+/// 0 (default, unset): each in the list of its draw, as before; 1: those
+/// of a run of draws in a list of their own before the list that draws, so
+/// that a run is not interleaved with our dispatches and barriers; 7: as 1
+/// with a barrier after each clamp, so that the budget is charged in the
+/// order of the draws (Belobug's default after seeing mesh objects flicker
+/// without it). Any other number counts as 1. Windows
+/// (`VICTORY_INDIRECT_WINDOW=1`) take precedence: hoisting is then off.
+/// From Belobug/VIctory-Belobug-AMD `ccab973`, `918ab03`, `afca189`,
+/// `76387c2` (GPL-3.0-or-later, beloooo), ported to this tree.
+pub(crate) fn hoist_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        let windows = std::env::var_os("VICTORY_INDIRECT_WINDOW").is_some_and(|v| v == "1");
+        let mode = std::env::var("VICTORY_HOIST_CLAMPS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u8>().ok())
+            .unwrap_or(0);
+        if windows && mode != 0 {
+            tracing::warn!("VICTORY_HOIST_CLAMPS is ignored: VICTORY_INDIRECT_WINDOW=1 is set");
+            return 0;
+        }
+        if mode != 0 {
+            tracing::warn!(mode, "clamps of indirect draws are hoisted into lists before their draws");
+        }
+        mode
+    })
+}
+
+/// Whether clamps of indirect draws go to a list before the one that draws.
+pub(crate) fn hoisting() -> bool {
+    hoist_mode() != 0
+}
+
+/// As [`bound`], recorded in `clamps`, a list that runs before the one that
+/// executes: the buffer and the offset of the clamped records, readable as
+/// indirect arguments once `clamps` ended ([`HostList::clamp_end`]).
+pub(crate) fn bound_before(
+    clamps: &HostList,
+    (src, src_offset): (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    (kind, stride, records): (u32, u32, u32),
+) -> Option<(ID3D12Resource, u64)> {
+    let bytes = validate_layout((kind, stride, records), src_offset, count.map(|(_, off)| off))?;
+    if records == 0 {
+        return None;
+    }
+    let (c, budget) = (clamp()?, clamps.budget()?);
+    // SAFETY: live buffers.
+    let (src_base, count_base) =
+        unsafe { (src.GetGPUVirtualAddress(), count.map(|(b, _)| b.GetGPUVirtualAddress())) };
+    // Addresses the shader's offsets (32 bits) reach, as in `record_clamp_as`.
+    let fits = |offset: u64, len: u64| offset.checked_add(len).is_some_and(|end| end <= u64::from(u32::MAX));
+    let (src_gpu, args_offset) = if fits(src_offset, bytes) {
+        (src_base, src_offset as u32)
+    } else {
+        (src_base.checked_add(src_offset)?, 0)
+    };
+    let (count_gpu, has_count, count_offset) = match (count, count_base) {
+        (Some((_, off)), Some(base)) if fits(off, 4) => (base, 1u32, off as u32),
+        (Some((_, off)), Some(base)) => (base.checked_add(off)?, 1, 0),
+        _ => (src_gpu, 0, 0),
+    };
+    if !src_gpu.is_multiple_of(4) || !count_gpu.is_multiple_of(4) || !budget.is_multiple_of(4) {
+        return None;
+    }
+    let (dst, at) = clamps.clamp_room(bytes)?;
+    // SAFETY: a live buffer.
+    let dst_gpu = unsafe { dst.GetGPUVirtualAddress() } + at;
+    let constants = [kind, stride, records, args_offset, has_count, count_offset];
+    let l = &clamps.list;
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::IndirectBounded, 1);
+    // SAFETY: an open list; our root signature and pipeline; live source,
+    // count, destination (writable: `clamp_room`) and budget buffers. The
+    // clamps write apart and charge the budget atomically.
+    unsafe {
+        l.SetComputeRootSignature(&c.root);
+        l.SetPipelineState(&c.pso);
+        l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+        l.SetComputeRootShaderResourceView(1, src_gpu);
+        l.SetComputeRootShaderResourceView(2, count_gpu);
+        l.SetComputeRootUnorderedAccessView(3, dst_gpu);
+        l.SetComputeRootUnorderedAccessView(4, budget);
+        l.Dispatch(records.div_ceil(64), 1, 1);
+        // Mode 7: one clamp after another, so that the budget is charged
+        // in the order of the draws, as when each clamp precedes its draw.
+        if hoist_mode() == 7 {
+            l.ResourceBarrier(&[uav_barrier()]);
+        }
+    }
+    Some((dst, at))
+}
+
 /// Whether every draw served from a window is checked against a fresh
 /// clamp of its record (`VICTORY_INDIRECT_WINDOW_CHECK=1`, with
 /// `VICTORY_INDIRECT_WINDOW=1`; off by default). A window clamps its
