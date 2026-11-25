@@ -194,7 +194,7 @@ enum Console {
 
 fn main() -> Result<()> {
     victory_core::env::alias_scarlett();
-    victory_core::logging::init("warn");
+    victory_core::logging::init("info");
     // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.
     #[cfg(all(windows, feature = "diagnostics"))]
     if victory_hle::modules::audio::capture::child() {

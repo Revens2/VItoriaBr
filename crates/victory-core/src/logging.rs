@@ -4,7 +4,8 @@
 //! `VICTORY_LOG=victory_loader=trace,info`. Debug and trace output exist
 //! only in builds with the `diagnostics` feature; a plain release build
 //! logs info and above whatever the filter asks for. Without a filter
-//! the caller's default applies (the app uses `warn`).
+//! the caller's default applies (the app uses `info`, so a run's log has
+//! its frame-time lines).
 
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
