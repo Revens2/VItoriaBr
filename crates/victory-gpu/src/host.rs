@@ -4898,7 +4898,7 @@ impl Host {
                         list.Dispatch((chunk.len() as u32).div_ceil(64), 1, 1);
                         at += chunk.len() as u64;
                     }
-                    CARD_STATS[0].fetch_add(m.runs.iter().map(|&(a, b)| (b - a) as u64).sum::<u64>(), Ordering::Relaxed);
+                    crate::shadow::CARD_STATS[0].fetch_add(m.runs.iter().map(|&(a, b)| (b - a) as u64).sum::<u64>(), Ordering::Relaxed);
                 }
                 // The hashes after it read what it wrote.
                 list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
