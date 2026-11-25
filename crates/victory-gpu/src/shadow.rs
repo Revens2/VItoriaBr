@@ -400,7 +400,7 @@ pub(crate) fn card_masked(sent_as: u64) -> Vec<(Arc<Shadow>, Arc<MaskBlocks>)> {
     }
     let carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
     let fetched = RELAY_FETCHED.load(Ordering::Acquire);
-    for weak in carded.iter() {
+    for weak in carded.values() {
         let Some(shadow) = weak.upgrade() else {
             continue;
         };
