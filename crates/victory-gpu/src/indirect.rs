@@ -32,7 +32,7 @@
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
-use windows::core::s;
+use windows::core::{Interface, s};
 
 use crate::host::{HostList, host, transition};
 
@@ -354,6 +354,34 @@ pub(crate) fn bound(
     clamp_into(list, c, &dst, budget, src, count, spec, false).then_some(dst)
 }
 
+/// Whether the windows have a scratch ring of their own and the clamps wait
+/// for the buffers they read only (`VICTORY_INDIRECT_RING=1`, off by
+/// default; needs `VICTORY_INDIRECT_WINDOW=1` for the ring): two buffers in
+/// turn for the windows, so that a clamp that is no window leaves them as
+/// they are and the last two windows can be read; a UAV barrier on the
+/// source (and count) buffer of a clamp, once until a shader that can write
+/// buffers runs, in place of the barrier for every write before and after
+/// each clamp. From fxceless/victory-fork#1053 (x0sman, `1bd3a5f`,
+/// GPL-3.0-or-later), whose profile gave -53 % on `ExecuteIndirect`
+/// (RTX 5070 Laptop; not measured here).
+pub(crate) fn ring() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_RING").is_some_and(|v| v == "1"))
+}
+
+/// [`bound_ahead`] into the ring of the windows ([`ring`]); `ahead`: more
+/// records than the one asked for.
+pub(crate) fn bound_window(
+    list: &HostList,
+    src: (&ID3D12Resource, u64),
+    spec: (u32, u32, u32),
+    ahead: bool,
+) -> Option<ID3D12Resource> {
+    let bytes = validate_layout(spec, src.1, None)?;
+    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_window_scratch(bytes)?);
+    clamp_into(list, c, &dst, budget, src, None, spec, ahead).then_some(dst)
+}
+
 /// [`bound`] for a window of records clamped ahead of the draws that will
 /// read them (`crate::draw`'s windows; no count buffer). The records past
 /// the ones the title filled are whatever the buffer holds, and each
@@ -389,9 +417,25 @@ fn clamp_into(
     ahead: bool,
 ) -> bool {
     let before = list.indirect_state(dst);
-    let recorded = record_clamp_as(c, &list.list, (dst, before), budget, src, count, spec, ahead);
+    // With the ring: a UAV barrier for the buffers not yet named since the
+    // last shader that can write buffers, in place of the global ones.
+    let targeted = ring().then(|| {
+        (
+            list.need_uav_barrier_for(src.0),
+            count.is_some_and(|(buf, _)| buf.as_raw() != src.0.as_raw() && list.need_uav_barrier_for(buf)),
+        )
+    });
+    let recorded = record_clamp_with_waits(c, &list.list, (dst, before), budget, src, count, spec, ahead, targeted);
     if recorded {
         list.indirect_readable(dst);
+        if let Some((need_src, need_count)) = targeted {
+            if need_src {
+                list.uav_barrier_made(src.0);
+            }
+            if need_count && let Some((buf, _)) = count {
+                list.uav_barrier_made(buf);
+            }
+        }
     }
     recorded
 }
@@ -405,12 +449,30 @@ fn clamp_into(
 fn record_clamp_as(
     c: &Clamp,
     l: &ID3D12GraphicsCommandList,
+    dst_and_before: (&ID3D12Resource, D3D12_RESOURCE_STATES),
+    budget: u64,
+    src: (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    spec: (u32, u32, u32),
+    ahead: bool,
+) -> bool {
+    record_clamp_with_waits(c, l, dst_and_before, budget, src, count, spec, ahead, None)
+}
+
+/// [`record_clamp_as`]; with `targeted` (`(source, count)`: whether a UAV
+/// barrier on that buffer is needed first), the barriers are those of
+/// [`ring`] and not the two global ones.
+#[allow(clippy::too_many_arguments)]
+fn record_clamp_with_waits(
+    c: &Clamp,
+    l: &ID3D12GraphicsCommandList,
     (dst, before): (&ID3D12Resource, D3D12_RESOURCE_STATES),
     budget: u64,
     (src, src_offset): (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
     (kind, stride, records): (u32, u32, u32),
     ahead: bool,
+    targeted: Option<(bool, bool)>,
 ) -> bool {
     let Some(bytes) = validate_layout(
         (kind, stride, records),
@@ -470,22 +532,54 @@ fn record_clamp_as(
     let waits = crate::copystat::barrier_test() & 2 == 0;
     #[cfg(not(feature = "diagnostics"))]
     let waits = true;
-    let first = [
-        uav_barrier(),
-        transition(dst, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
-    ];
-    let second = [
-        uav_barrier(),
-        transition(
-            dst,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-        ),
-    ];
-    let skip = usize::from(!waits);
+    let (first, second): (Vec<D3D12_RESOURCE_BARRIER>, Vec<D3D12_RESOURCE_BARRIER>) = match targeted {
+        None => {
+            let skip = usize::from(!waits);
+            let first = [
+                uav_barrier(),
+                transition(dst, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+            ];
+            let second = [
+                uav_barrier(),
+                transition(
+                    dst,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                ),
+            ];
+            (first.into_iter().skip(skip).collect(), second.into_iter().skip(skip).collect())
+        }
+        Some((need_src, need_count)) => {
+            // The writes to the arguments and the count wait; `dst` is
+            // ordered by its own transitions (the budget is only added to
+            // with atomics).
+            let mut first = Vec::with_capacity(3);
+            if waits && need_src {
+                first.push(uav_barrier_for(src));
+            }
+            if waits
+                && need_count
+                && let Some((buf, _)) = count
+                && buf.as_raw() != src.as_raw()
+            {
+                first.push(uav_barrier_for(buf));
+            }
+            if before != D3D12_RESOURCE_STATE_UNORDERED_ACCESS {
+                first.push(transition(dst, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
+            }
+            let second = vec![transition(
+                dst,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+            )];
+            (first, second)
+        }
+    };
     unsafe {
         // Earlier shader writes (the title's argument and count passes) first.
-        l.ResourceBarrier(&first[skip..]);
+        if !first.is_empty() {
+            l.ResourceBarrier(&first);
+        }
         if records > 0 {
             l.SetComputeRootSignature(&c.root);
             l.SetPipelineState(&c.pso);
@@ -496,7 +590,9 @@ fn record_clamp_as(
             l.SetComputeRootUnorderedAccessView(4, budget);
             l.Dispatch(records.div_ceil(64), 1, 1);
         }
-        l.ResourceBarrier(&second[skip..]);
+        if !second.is_empty() {
+            l.ResourceBarrier(&second);
+        }
     }
     true
 }
@@ -758,7 +854,6 @@ fn record_gather_as(
 /// False if anything could not be recorded: the slots then hold no clamped
 /// records and the list must not run.
 pub(crate) fn record_gathers(l: &ID3D12GraphicsCommandList, sets: &[GatherSet], budget: &ID3D12Resource) -> bool {
-    use windows::core::Interface;
     let (Some(c), Ok(l2)) = (clamp(), l.cast::<ID3D12GraphicsCommandList2>()) else {
         return false;
     };
@@ -997,6 +1092,20 @@ pub(crate) fn check_hit(
         ]);
     }
     true
+}
+
+/// A UAV barrier on `resource` alone (from fxceless/victory-fork#1053).
+fn uav_barrier_for(resource: &ID3D12Resource) -> D3D12_RESOURCE_BARRIER {
+    D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                // SAFETY: a borrowed pointer; the barrier never releases it.
+                pResource: unsafe { std::mem::transmute_copy(resource) },
+            }),
+        },
+    }
 }
 
 fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
