@@ -425,8 +425,7 @@ fn scheduler() -> Option<&'static Scheduler> {
         })
         .as_ref()?;
     STARTED.call_once(|| {
-        let workers =
-            dstorage_worker_count(std::thread::available_parallelism().map_or(4, |n| n.get()));
+        let workers = worker_count();
         let started = (0..workers)
             .filter(|i| {
                 std::thread::Builder::new()
@@ -444,6 +443,80 @@ fn scheduler() -> Option<&'static Scheduler> {
 /// `cores` logical processors.
 fn dstorage_worker_count(cores: usize) -> usize {
     cores.clamp(2, 16)
+}
+
+/// How many storage workers run. `VICTORY_DSTORAGE_WORKERS=N` (1..=64) sets
+/// the count outright. `VICTORY_DSTORAGE_PHYSICAL=1` sizes the pool to the
+/// PC's physical cores instead of its logical processors (SMT twins add
+/// little to a pool that already oversubscribes the cores the submitting
+/// thread and the copies need); default off: logical processors, 2..=16
+/// (`dstorage_worker_count`).
+///
+/// Port of fxceless/victory-fork PR #1044 by Key (GPL-3.0), commit
+/// 0bba76248edd, there on by default (author: `copying back` 5.7 -> 2.4-3.5
+/// ms/MB on an 8-core/16-thread laptop); here behind a switch to measure.
+fn worker_count() -> usize {
+    static COUNT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *COUNT.get_or_init(|| {
+        if let Some(n) = std::env::var("VICTORY_DSTORAGE_WORKERS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|n| (1..=64).contains(n))
+        {
+            return n;
+        }
+        let logical = std::thread::available_parallelism().map_or(4, |n| n.get());
+        if std::env::var_os("VICTORY_DSTORAGE_PHYSICAL").is_some_and(|v| v == "1") {
+            return physical_cores().unwrap_or_else(|| (logical / 2).max(2)).clamp(1, 32);
+        }
+        dstorage_worker_count(logical)
+    })
+}
+
+/// The PC's physical cores, if the system will say so (`RelationProcessorCore`
+/// returns one record per core, whatever its SMT twins are).
+#[cfg(windows)]
+fn physical_cores() -> Option<usize> {
+    use windows_sys::Win32::System::SystemInformation::{
+        GetLogicalProcessorInformationEx, RelationProcessorCore,
+        SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
+    };
+    let mut len: u32 = 0;
+    // SAFETY: a null buffer asks for the size; the call fails with
+    // ERROR_INSUFFICIENT_BUFFER and fills `len`.
+    unsafe { GetLogicalProcessorInformationEx(RelationProcessorCore, std::ptr::null_mut(), &mut len) };
+    if len == 0 {
+        return None;
+    }
+    let mut buf = vec![0u8; len as usize];
+    // SAFETY: the buffer is `len` bytes and the call writes at most that.
+    let ok = unsafe {
+        GetLogicalProcessorInformationEx(
+            RelationProcessorCore,
+            buf.as_mut_ptr().cast::<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(),
+            &mut len,
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    let mut at = 0usize;
+    let mut cores = 0usize;
+    while at + 8 <= buf.len() {
+        // SAFETY: the record's own header; `Size` is its first field.
+        let size = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(at).cast::<u32>()) } as usize;
+        if size < 8 || at + size > buf.len() {
+            break;
+        }
+        cores += 1;
+        at += size;
+    }
+    (cores > 0).then_some(cores)
+}
+
+#[cfg(not(windows))]
+fn physical_cores() -> Option<usize> {
+    None
 }
 
 impl Scheduler {
