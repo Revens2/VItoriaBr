@@ -1308,7 +1308,7 @@ impl Staging {
             if !crate::host::read_into(self.memory, read) {
                 return false;
             }
-            last.hash = Some(blake3::hash(read));
+            last.hash = Some(digest(read));
             self.detile(read);
             last.asked = now;
             last.ahead = Some(crate::frame::current());
@@ -1370,12 +1370,14 @@ impl Staging {
                 "a sampled texture's memory is all zero (not streamed yet, or a failed BCPack read)"
             );
         }
-        self.target().detile(tiled, tiled.len() >= WIDE_FROM && wide());
+        self.target(held).detile(tiled, tiled.len() >= WIDE_FROM && wide());
     }
 
-    fn target(&self) -> Target<'_> {
+    fn target(&self, held: u32) -> Target<'_> {
         Target {
             layout: &self.layout,
+            held,
+            first_mip: self.first_mip,
             mips: self.mips,
             footprints: &self.footprints,
             rows: &self.rows,
@@ -1389,6 +1391,10 @@ impl Staging {
 /// footprints of the host texture's subresources say.
 struct Target<'a> {
     layout: &'a victory_formats::texture::Layout,
+    /// The levels that are the title's (bit per mip); the others are zeros.
+    held: u32,
+    /// Levels of the title's layout dropped before the first of the buffer.
+    first_mip: u32,
     /// Mips per array slice.
     mips: u32,
     footprints: &'a [D3D12_PLACED_SUBRESOURCE_FOOTPRINT],
@@ -1432,7 +1438,7 @@ impl Target<'_> {
             let linear = unsafe {
                 std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
             };
-            if mip < 32 && held & (1 << mip) == 0 {
+            if mip < 32 && self.held & (1 << mip) == 0 {
                 // Not the title's: zeros, not what lies in that memory.
                 linear.fill(0);
                 continue;
@@ -1474,10 +1480,15 @@ impl Target<'_> {
         let mut bytes = 0;
         for (i, (footprint, &rows)) in self.footprints.iter().zip(self.rows).enumerate() {
             let (mip, slice) = (i as u32 % self.mips, i as u32 / self.mips);
-            let m = self.layout.mips.get(mip as usize)?;
+            let m = self.layout.mips.get((mip + self.first_mip) as usize)?;
             let f = footprint.Footprint;
             let (offset, pitch) = (footprint.Offset as usize, f.RowPitch as usize);
             let depth_pitch = pitch * rows as usize;
+            if mip < 32 && self.held & (1 << mip) == 0 {
+                // Not the title's: zeros, not what lies in that memory.
+                take(offset, depth_pitch * f.Depth as usize)?.fill(0);
+                continue;
+            }
             let row = m.width as usize * n;
             let mut parts = Vec::new();
             if m.depth == 1 && m.height > 0 {
@@ -1487,13 +1498,13 @@ impl Target<'_> {
                     let bottom = (top + step).min(m.height);
                     let len = (bottom - top - 1) as usize * pitch + row;
                     let linear = take(offset + top as usize * pitch, len)?;
-                    parts.push(Part::Rows { mip, slice, rows: top..bottom, linear, pitch });
+                    parts.push(Part::Rows { mip: mip + self.first_mip, slice, rows: top..bottom, linear, pitch });
                     top = bottom;
                 }
             } else {
                 let len = (m.depth as usize).checked_sub(1)? * depth_pitch + (m.height as usize).checked_sub(1)? * pitch + row;
                 let linear = take(offset, len)?;
-                parts.push(Part::Whole { mip, slice, linear, pitch, depth_pitch });
+                parts.push(Part::Whole { mip: mip + self.first_mip, slice, linear, pitch, depth_pitch });
             }
             for part in parts {
                 bytes += part.len();
@@ -2265,7 +2276,7 @@ mod wide_tests {
             let mut one = vec![0xeeu8; bytes + slack];
             let mut many = vec![0xeeu8; bytes + slack];
             for (buffer, wide) in [(&mut one, false), (&mut many, true)] {
-                Target { layout: &l, mips, footprints: &footprints, rows: &rows, data: buffer.as_mut_ptr(), bytes }
+                Target { layout: &l, held: u32::MAX, first_mip: 0, mips, footprints: &footprints, rows: &rows, data: buffer.as_mut_ptr(), bytes }
                     .detile(&tiled, wide);
             }
             assert!(one[..bytes] == many[..bytes], "{:?}", l.desc);
@@ -2409,7 +2420,7 @@ mod wide_tests {
             let (footprints, rows, bytes, mips) = footprints(&l);
             let tiled: Vec<u8> = (0..l.size as usize).map(|i| (i * 131) as u8).collect();
             let mut buffer = vec![0u8; bytes + (64 << 10)];
-            let target = Target { layout: &l, mips, footprints: &footprints, rows: &rows, data: buffer.as_mut_ptr(), bytes };
+            let target = Target { layout: &l, held: u32::MAX, first_mip: 0, mips, footprints: &footprints, rows: &rows, data: buffer.as_mut_ptr(), bytes };
             let one = time(20, || target.detile(&tiled, false));
             let many = time(20, || target.detile(&tiled, true));
             println!(
