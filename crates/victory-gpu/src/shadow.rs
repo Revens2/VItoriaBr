@@ -77,6 +77,102 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    /// With `crate::rebar`: the bytes of `buffer`, which is in the card's
+    /// memory the CPU maps (0: it is not).
+    rebar: u64,
+    /// `VICTORY_MEM2_GPU_ONLY_NOSNAP`: the ranges declared in `pending`
+    /// have no snapshot; title memory stands for it ([`Shadow::writing`]).
+    nosnap: std::sync::atomic::AtomicBool,
+    /// With `nosnap`: title bytes the runtime overwrote during the flight,
+    /// as they were before ([`title_will_change`]).
+    pre: Mutex<victory_core::mem2::PreImages>,
+}
+
+/// `VICTORY_MEM2_GPU_ONLY_NOSNAP`: the copies whose declared ranges have no
+/// snapshot, until they are copied back ([`Shadow::copy_back_done`]).
+static NOSNAP_FLYING: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
+/// How many there are, read without the lock.
+static NOSNAP_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+thread_local! {
+    /// The copy whose copy-back this thread is doing (its own writes need
+    /// no pre-image).
+    static OWN_BACK: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The copies without a snapshot whose memory shares a byte with
+/// `[at, at + len)`.
+fn nosnap_over(at: usize, len: usize) -> Vec<Arc<Shadow>> {
+    let end = at.saturating_add(len);
+    let flying = NOSNAP_FLYING.lock().unwrap_or_else(|e| e.into_inner());
+    flying
+        .iter()
+        .filter_map(std::sync::Weak::upgrade)
+        .filter(|s| (s.start as usize) < end && at < (s.start + s.len) as usize)
+        .collect()
+}
+
+/// The runtime is about to write title memory `[at, at + len)` (or the
+/// CPU will be able to: [`gpu_only_exposed`]): copies compared with title
+/// memory after their flight keep the bytes from before the write.
+pub(crate) fn title_will_change(at: usize, len: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if NOSNAP_COUNT.load(Relaxed) == 0 || len == 0 {
+        return;
+    }
+    let own = OWN_BACK.with(|o| o.get());
+    for s in nosnap_over(at, len) {
+        if s.id == own {
+            continue;
+        }
+        let (lo, hi) = (s.start as usize, (s.start + s.len) as usize);
+        let took = s.pre.lock().unwrap_or_else(|e| e.into_inner()).before_write(at, len, lo, hi, |a, into| {
+            crate::host::read_into(a as *const u8, into)
+        });
+        crate::mem2::NOSNAP[2].fetch_add(took as u64, Relaxed);
+    }
+}
+
+/// Title memory `[at, at + len)` was written already (physical pages
+/// written through a view of the runtime's own): where a copy compared with
+/// title memory took no bytes before, the title's bytes win.
+pub(crate) fn title_changed(at: usize, len: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if NOSNAP_COUNT.load(Relaxed) == 0 || len == 0 {
+        return;
+    }
+    for s in nosnap_over(at, len) {
+        let (lo, hi) = (s.start as usize, (s.start + s.len) as usize);
+        s.pre.lock().unwrap_or_else(|e| e.into_inner()).after_write(at, len, lo, hi);
+    }
+}
+
+/// `victory-hle` xmem: the page shown at GPU-only address `at` is now shown
+/// where the CPU can reach it too, so the title may write it from now on.
+pub fn gpu_only_exposed(at: usize) {
+    title_will_change(at / PAGE * PAGE, PAGE);
+}
+
+/// A write of title memory whose place is not known is about to run while
+/// a submission is prepared: copies compared with title memory take their
+/// snapshot now, as they would have when declared (no shader ran since).
+pub(crate) fn nosnap_unknown_write() {
+    use std::sync::atomic::Ordering::Relaxed;
+    if NOSNAP_COUNT.load(Relaxed) == 0 {
+        return;
+    }
+    let all: Vec<Arc<Shadow>> = {
+        let flying = NOSNAP_FLYING.lock().unwrap_or_else(|e| e.into_inner());
+        flying.iter().filter_map(std::sync::Weak::upgrade).collect()
+    };
+    for s in all {
+        s.nosnap_demote();
+    }
+}
+
+/// For `crate::mem2`: whether snapshots are kept ([`keeps`]).
+pub(crate) fn keeps_snapshots() -> bool {
+    keeps()
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -139,19 +235,71 @@ pub(crate) fn cards() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_BUFFERS").is_none_or(|v| v != "0"))
 }
 
+/// Default `(min_mb, max_mb)` for [`card_limits`] chosen from the adapter's
+/// local VRAM budget (`DXGI_QUERY_VIDEO_MEMORY_INFO.Budget`), in bytes.
+///
+/// - Unknown (`None`, e.g. WARP) or `<= 12 GiB` (8–12 GB cards, whose WDDM
+///   budget is below 12 GiB): `(16, 512)` MiB, matching the 12 GB baseline.
+/// - `> 12 GiB` and `< 20 GiB` (16 GB cards, whose WDDM budget is typically
+///   ~13.5–15.2 GiB): `(4, 2048)` MiB.
+/// - `>= 20 GiB` (24–32+ GB cards): `(1, (budget_mb / 4).min(8192))` MiB,
+///   capping at 25% of local budget (at most 8 GiB) so "before" twins (up to 2x)
+///   still leave headroom for textures and render targets.
+fn default_card_limits_mb(local_vram_budget: Option<u64>) -> (u64, u64) {
+    let Some(budget_bytes) = local_vram_budget else {
+        return (16, 512);
+    };
+    let budget_mb = budget_bytes >> 20;
+    const TWELVE_GIB_MB: u64 = 12 * 1024;
+    const TWENTY_GIB_MB: u64 = 20 * 1024;
+    if budget_mb <= TWELVE_GIB_MB {
+        (16, 512)
+    } else if budget_mb < TWENTY_GIB_MB {
+        (4, 2048)
+    } else {
+        (1, (budget_mb / 4).min(8192))
+    }
+}
+
+/// Resolve `(min_bytes, max_bytes)` from the adapter's local VRAM budget and
+/// optional explicit MiB overrides from `VICTORY_CARD_BUFFERS_MIN_MB` /
+/// `VICTORY_CARD_BUFFERS_MB`.
+fn resolve_card_limits(
+    local_vram_budget: Option<u64>,
+    min_mb_override: Option<u64>,
+    max_mb_override: Option<u64>,
+) -> (u64, u64) {
+    const MIB: u64 = 1 << 20;
+    let (default_min_mb, default_max_mb) = default_card_limits_mb(local_vram_budget);
+    let min_bytes = min_mb_override.unwrap_or(default_min_mb).saturating_mul(MIB).max(MIB);
+    let max_bytes = max_mb_override.unwrap_or(default_max_mb).saturating_mul(MIB);
+    (min_bytes, max_bytes)
+}
+
 /// The smallest title buffer whose copy goes to the card's memory, and the
 /// most bytes of such copies (their "before" twins not counted: a copy
 /// shaders write takes its size twice), both in bytes:
-/// `VICTORY_CARD_BUFFERS_MIN_MB` (16) and `VICTORY_CARD_BUFFERS_MB` (512).
-/// Run 69's gameplay has ten title buffers of 16 MiB or more, 494 MB, and
-/// 1,650 MB of the card's budget free.
+/// `VICTORY_CARD_BUFFERS_MIN_MB` and `VICTORY_CARD_BUFFERS_MB`.
+/// Defaults scale with the adapter's local VRAM budget (16 MiB / 512 MiB on
+/// `<= 12 GiB` budgets, 4 MiB / 2048 MiB on 16 GB cards, 1 MiB / up to 8192 MiB
+/// on `>= 20 GiB` budgets), and explicit env vars always override.
 fn card_limits() -> (u64, u64) {
     static LIMITS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
     *LIMITS.get_or_init(|| {
-        let mb = |name: &str, default: u64| {
-            std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default) << 20
-        };
-        (mb("VICTORY_CARD_BUFFERS_MIN_MB", 16).max(1 << 20), mb("VICTORY_CARD_BUFFERS_MB", 512))
+        let env_mb = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok());
+        let vram_budget = crate::host::host().and_then(|h| h.video_memory()).map(|[budget, ..]| budget);
+        let (min_bytes, max_bytes) = resolve_card_limits(
+            vram_budget,
+            env_mb("VICTORY_CARD_BUFFERS_MIN_MB"),
+            env_mb("VICTORY_CARD_BUFFERS_MB"),
+        );
+        tracing::info!(
+            vram_budget_mb = vram_budget.map(|b| b >> 20),
+            card_buffers_min_mb = min_bytes >> 20,
+            card_buffers_max_mb = max_bytes >> 20,
+            "card buffer limits"
+        );
+        (min_bytes, max_bytes)
     })
 }
 
@@ -454,7 +602,7 @@ mod card_tests {
 
 /// Whether the copy-back of what shaders wrote runs on a thread of its own,
 /// beside the submitting thread and outside the submission lock
-/// (`VICTORY_RELAY=1` or `2`; off by default; not with kept snapshots,
+/// ([`relay_level`] above 0; off by default; not with kept snapshots,
 /// [`keeps`]). `crate::host::relay` says what it does; here it changes
 /// what a copy keeps:
 ///
@@ -470,7 +618,27 @@ mod card_tests {
 ///   had not received from bytes the card wrote.
 pub(crate) fn relay() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VICTORY_RELAY").is_ok_and(|v| v == "1" || v == "2") && !keeps())
+    *ON.get_or_init(|| relay_level() > 0 && !keeps())
+}
+
+/// The relay's stage from `VICTORY_RELAY`: `1` is its first stage, `2` its
+/// second (`crate::host::relay`), anything else (or unset) off. Stage 2 took
+/// the frame from about 230 to about 132 ms on an RTX 4090 (victory-fork
+/// #187), but in the same-save A/B of victory-fork #168 every relay or
+/// late-wait run lost the first room's walls and no default run did, so it
+/// stays off by default in this tree until that is understood.
+pub(crate) fn relay_level() -> u8 {
+    static LEVEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *LEVEL.get_or_init(|| relay_level_of(std::env::var("VICTORY_RELAY").ok().as_deref()))
+}
+
+/// [`relay_level`] for a value of `VICTORY_RELAY` (`None`: unset).
+fn relay_level_of(value: Option<&str>) -> u8 {
+    match value.map(str::trim) {
+        Some("1") => 1,
+        Some("2") => 2,
+        _ => 0,
+    }
 }
 
 /// The submission being prepared (its number among those started): what
@@ -591,7 +759,17 @@ fn outside(from: usize, to: usize, mut skip: Vec<(usize, usize)>) -> Vec<(usize,
 
 #[cfg(test)]
 mod relay_tests {
-    use super::{Flights, changed_runs, merge_piece, outside};
+    use super::{Flights, changed_runs, merge_piece, outside, relay_level_of};
+
+    #[test]
+    fn the_relay_is_off_unless_told_a_stage() {
+        assert_eq!(relay_level_of(None), 0);
+        assert_eq!(relay_level_of(Some("2")), 2);
+        assert_eq!(relay_level_of(Some(" 2 ")), 2);
+        assert_eq!(relay_level_of(Some("1")), 1);
+        assert_eq!(relay_level_of(Some("0")), 0);
+        assert_eq!(relay_level_of(Some("")), 0);
+    }
 
     /// A range two flights declared is free only when both are done, in
     /// either order; a submission that declares it many times counts once.
@@ -830,10 +1008,23 @@ fn pooled(n: usize) -> Vec<u8> {
     v
 }
 
+/// Snapshot buffer pool byte cap scaled from total system RAM.
+fn snapshot_pool_cap(total_ram_bytes: Option<u64>) -> usize {
+    const FALLBACK: u64 = 512 << 20;
+    const MIN: u64 = 128 << 20;
+    const MAX: u64 = 1024 << 20;
+    let bytes = match total_ram_bytes {
+        Some(ram) => (ram / 32).clamp(MIN, MAX),
+        None => FALLBACK,
+    };
+    bytes as usize
+}
+
 /// Returns a snapshot buffer to the pool: at most 8 kept, the largest, and
-/// of those the largest one and the next ones up to `KEPT` bytes in all.
+/// of those the largest one and the next ones up to [`snapshot_pool_cap`]
+/// bytes in all.
 fn give_back(v: Vec<u8>) {
-    const KEPT: usize = 512 << 20;
+    let kept = snapshot_pool_cap(crate::total_system_ram_bytes());
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     pool.push(v);
     pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
@@ -842,7 +1033,7 @@ fn give_back(v: Vec<u8>) {
     pool.retain(|v| {
         seen += 1;
         total = total.saturating_add(v.capacity());
-        seen == 1 || total <= KEPT
+        seen == 1 || total <= kept
     });
 }
 
@@ -1386,6 +1577,11 @@ mod merge_tests {
 /// snapshot still holds) and the bytes of title memory they copy.
 static LIVE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
+/// Bytes of host copies alive by the title pool they copy
+/// ([`crate::watch::pool_class`]): GPU-only reservations, physical-page
+/// placeholders, other memory.
+pub(crate) static POOL_LIVE: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
 impl Drop for Shadow {
     fn drop(&mut self) {
         if self.place.is_some() {
@@ -1395,6 +1591,10 @@ impl Drop for Shadow {
         }
         LIVE[0].fetch_sub(1, Ordering::Relaxed);
         LIVE[1].fetch_sub(self.len, Ordering::Relaxed);
+        POOL_LIVE[crate::watch::pool_class(self.start as usize)].fetch_sub(self.len, Ordering::Relaxed);
+        if self.rebar != 0 {
+            crate::rebar::released(self.rebar);
+        }
         if self.kept.get_mut().unwrap_or_else(|e| e.into_inner()).1 {
             KEPT_BYTES.fetch_sub(self.len, Ordering::Relaxed);
         }
@@ -1565,17 +1765,20 @@ pub(crate) fn window_use() -> [u64; 8] {
 /// The next read of that memory makes a new copy and copies the window
 /// again. Called before a submission starts, by the thread that submits.
 pub(crate) fn let_go_idle() {
-    const IDLE_MS: u64 = 10_000;
     const IDLE_FRAMES: u64 = 4;
     let gone: Vec<Arc<Shadow>> = {
         // Held from the look to the removal: `loose` hands a copy out
         // under the same lock, so none is handed out in between.
         let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        if map.is_empty() {
+            return;
+        }
+        let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
         let idle: Vec<(u64, u64)> = map
             .iter()
             .filter(|(_, s)| {
                 Arc::strong_count(s) == 1
-                    && crate::host::long_ago(s.used.load(Ordering::Relaxed), IDLE_MS, IDLE_FRAMES)
+                    && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES)
                     && crate::host::references(&s.buffer) == 1
             })
             .map(|(key, _)| *key)
@@ -1661,6 +1864,12 @@ impl Shadow {
     }
 
     /// The copy's own number (see the field).
+    /// Whether the copy is placed over title memory in place (other
+    /// buffers may alias it).
+    pub(crate) fn in_place(&self) -> bool {
+        self.place.is_some()
+    }
+
     pub(crate) fn id(&self) -> u64 {
         self.id
     }
@@ -1681,6 +1890,7 @@ impl Shadow {
         // title wrote there.
         LIVE[0].fetch_sub(1, Ordering::Relaxed);
         LIVE[1].fetch_sub(len, Ordering::Relaxed);
+        POOL_LIVE[crate::watch::pool_class(start as usize)].fetch_sub(len, Ordering::Relaxed);
         *shadow.watched.get_mut() = NOT_WATCHED;
         shadow.window = window;
         shadow.place = Some((placed.heap, placed.bias));
@@ -1698,6 +1908,7 @@ impl Shadow {
         let pages = (start + len).div_ceil(PAGE as u64) - start / PAGE as u64;
         LIVE[0].fetch_add(1, Ordering::Relaxed);
         LIVE[1].fetch_add(len, Ordering::Relaxed);
+        POOL_LIVE[crate::watch::pool_class(start as usize)].fetch_add(len, Ordering::Relaxed);
         Shadow {
             buffer,
             data,
@@ -1720,7 +1931,170 @@ impl Shadow {
             card: None,
             window: false,
             place: None,
+            rebar: 0,
+            nosnap: std::sync::atomic::AtomicBool::new(false),
+            pre: Mutex::default(),
         }
+    }
+
+    /// `VICTORY_MEM2_GPU_ONLY_NOSNAP`: whether the ranges shaders write in
+    /// this flight can go without a snapshot. Title memory then stands for
+    /// it, which takes that nothing changes it during the flight but what
+    /// the runtime is told of: the copy lies in a GPU-only reservation (the
+    /// title's code cannot reach it), no page it shows is shown where the
+    /// CPU can reach it (xmem's record; a page that becomes so is told,
+    /// [`gpu_only_exposed`]), and it is no read-back buffer. A copy in the
+    /// card's memory or in place has no snapshot anyway.
+    fn nosnap_ok(&self) -> bool {
+        let (start, len) = (self.start as usize, self.len as usize);
+        crate::mem2::nosnap()
+            && self.card.is_none()
+            && self.place.is_none()
+            && len > 0
+            && crate::watch::all_gpu_only(start, len)
+            && crate::mem2::cpu_free(start, len)
+            && !crate::readback::tagged_in(self.start, self.len)
+    }
+
+    /// The parts (offsets in the copy) newly declared in a flight without a
+    /// snapshot: by 64 KiB piece, where the copy holds what title memory
+    /// holds, title memory stands for its bytes from before the flight;
+    /// where it does not (a range shaders write that no refresh brought up
+    /// to date), the copy's bytes are kept for that piece, as a snapshot
+    /// would keep them. A piece kept already takes the part's bytes anew.
+    fn nosnap_declare(&self, parts: &[(usize, usize)]) {
+        let start = self.start as usize;
+        let (lo, hi) = (start, start + self.len as usize);
+        let mut title = vec![0u8; PIECE];
+        let mut pre = self.pre.lock().unwrap_or_else(|e| e.into_inner());
+        for &(from, to) in parts {
+            let mut at = from;
+            while at < to {
+                let n = (PIECE - (start + at) % PIECE).min(to - at);
+                // SAFETY: inside the copy's mapping, which no shader writes
+                // before the submission goes.
+                let host = unsafe { std::slice::from_raw_parts(self.data.add(at), n) };
+                let differs = !crate::host::read_into((start + at) as *const u8, &mut title[..n]) || title[..n] != *host;
+                if differs {
+                    crate::mem2::NOSNAP[2].fetch_add(n as u64, Ordering::Relaxed);
+                }
+                pre.declare(
+                    start + at,
+                    n,
+                    lo,
+                    hi,
+                    differs,
+                    // SAFETY (both): inside the copy's mapping, as above.
+                    |a, into| unsafe { std::ptr::copy_nonoverlapping(self.data.add(a - start), into.as_mut_ptr(), into.len()) },
+                    |a, into| crate::host::read_into(a as *const u8, into),
+                );
+                at += n;
+            }
+        }
+    }
+
+    /// The declared ranges get their snapshot after all (from the copy,
+    /// which no shader has written since they were declared): a write of
+    /// title memory that is not told where is about to run.
+    fn nosnap_demote(&self) {
+        let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        if !self.nosnap.swap(false, Ordering::Relaxed) {
+            return;
+        }
+        let total = self.len as usize;
+        let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let snapshot = before.get_or_insert_with(|| pooled(total));
+        for &(a, e) in pending.iter() {
+            let (from, to) = self.inside(a, e - a);
+            if from < to {
+                // SAFETY: the copy's mapping and the snapshot's allocation
+                // both hold `total` bytes, and `to <= total`.
+                unsafe { copy_wide(self.data.add(from), snapshot.as_mut_ptr().add(from), to - from) };
+            }
+        }
+        *self.pre.lock().unwrap_or_else(|e| e.into_inner()) = victory_core::mem2::PreImages::new();
+        crate::mem2::NOSNAP[4].fetch_add(1, Ordering::Relaxed);
+        drop(before);
+        drop(pending);
+        self.nosnap_forget();
+    }
+
+    /// Out of [`NOSNAP_FLYING`].
+    fn nosnap_forget(&self) {
+        let mut flying = NOSNAP_FLYING.lock().unwrap_or_else(|e| e.into_inner());
+        let n = flying.len();
+        flying.retain(|w| w.upgrade().is_some_and(|s| s.id != self.id));
+        NOSNAP_COUNT.fetch_sub(n - flying.len(), Ordering::Relaxed);
+    }
+
+    /// [`Shadow::copy_back_with`] for a copy without a snapshot: by 64 KiB
+    /// piece of `[from, to)`, the copy against what stands for the bytes
+    /// from before the flight (title memory itself, or the bytes taken
+    /// before the runtime wrote it). Returns the bytes written.
+    fn copy_back_nosnap(&self, from: usize, to: usize) -> usize {
+        use victory_core::mem2::Before;
+        let start = self.start as usize;
+        let mut written = 0;
+        let mut title = vec![0u8; PIECE];
+        let mut at = from;
+        OWN_BACK.with(|o| o.set(self.id));
+        while at < to {
+            let n = (PIECE - (start + at) % PIECE).min(to - at);
+            let piece = at;
+            at += n;
+            // SAFETY: inside the mapping; only the submitting thread writes
+            // it after the flight.
+            let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(piece), n) };
+            let title = &mut title[..n];
+            if !crate::host::read_into((start + piece) as *const u8, title) {
+                continue;
+            }
+            let pre = self.pre.lock().unwrap_or_else(|e| e.into_inner());
+            let old: &[u8] = match pre.before(start + piece) {
+                Before::Title => &*title,
+                Before::Taken(bytes) => {
+                    // Taken from the piece's first byte in the copy on (the
+                    // 64 KiB line, or the copy's start).
+                    let taken_from = ((start + piece) / PIECE * PIECE).max(start);
+                    let skip = start + piece - taken_from;
+                    let Some(old) = bytes.get(skip..skip + n) else {
+                        continue;
+                    };
+                    old
+                }
+                Before::Tainted => {
+                    crate::mem2::NOSNAP[3].fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+            };
+            let Some(first) = first_difference(host, old) else {
+                continue;
+            };
+            let last = last_difference(host, old).unwrap_or(first);
+            let old = old[first..=last].to_vec();
+            drop(pre);
+            self.changed(piece + first, piece + last + 1);
+            let (host, title) = (&mut host[first..=last], &mut title[first..=last]);
+            // As with a snapshot: the GPU's byte where the copy's is not
+            // what it was before the flight, else the title's.
+            let mut differs = 0u8;
+            for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(&old) {
+                let gpu = if *h != *o { 0xffu8 } else { 0 };
+                let merged = (*t & !gpu) | (*h & gpu);
+                differs |= merged ^ *t;
+                *t = merged;
+                *h = merged;
+            }
+            if differs != 0 {
+                let (at, n) = (start + piece + first, last + 1 - first);
+                crate::watch::writing_soft(at, n);
+                crate::host::write_mapped(at as *mut u8, title.as_ptr(), n);
+                written += n;
+            }
+        }
+        OWN_BACK.with(|o| o.set(0));
+        crate::mem2::NOSNAP[5].fetch_add(written as u64, Ordering::Relaxed);
+        written
     }
 
     /// `[address, address + len)` cut to the buffer, as offsets in the copy.
@@ -1749,6 +2123,10 @@ impl Shadow {
             return;
         }
         let len = len.min(self.left(address));
+        // Testing switch: only the title's read-back buffers are copied back.
+        if !crate::readback::copy_back(address, len) {
+            return;
+        }
         list.defer_gpu_write(self, address as usize, len as usize);
     }
 
@@ -1760,7 +2138,7 @@ impl Shadow {
     /// snapshot grown to cover each was copied whole every time), in reused
     /// memory (fresh snapshots cost ~2.3 million page faults per world
     /// frame).
-    pub(crate) fn writing(&self, address: usize, len: usize) {
+    pub(crate) fn writing(self: &Arc<Self>, address: usize, len: usize) {
         if self.place.is_some() {
             return;
         }
@@ -1781,6 +2159,22 @@ impl Shadow {
         if self.card.is_some() {
             pending.push(range);
             return;
+        }
+        // `VICTORY_MEM2_GPU_ONLY_NOSNAP`: decided when the flight's first
+        // range is declared, for all of them (title memory stands for the
+        // snapshot: [`Shadow::nosnap_ok`]).
+        if crate::mem2::nosnap()
+            && pending.is_empty()
+            && self.before.lock().unwrap_or_else(|e| e.into_inner()).is_none()
+            && !self.nosnap.load(Ordering::Relaxed)
+            && self.nosnap_ok()
+        {
+            self.nosnap.store(true, Ordering::Relaxed);
+            *self.pre.lock().unwrap_or_else(|e| e.into_inner()) = victory_core::mem2::PreImages::new();
+            NOSNAP_FLYING.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(self));
+            NOSNAP_COUNT.fetch_add(1, Ordering::Relaxed);
+            crate::mem2::NOSNAP[0].fetch_add(1, Ordering::Relaxed);
+            crate::mem2::NOSNAP[1].fetch_add(self.len, Ordering::Relaxed);
         }
         // The parts no declared range holds yet: their bytes are taken now,
         // just after the range's refresh (a part declared earlier has not
@@ -1806,6 +2200,10 @@ impl Shadow {
         pending.push(range);
         let taken: usize = parts.iter().map(|&(from, to)| to.saturating_sub(from)).sum();
         BACK_CLASS[usize::from(!self.window)].fetch_add(taken as u64, Ordering::Relaxed);
+        if self.nosnap.load(Ordering::Relaxed) {
+            self.nosnap_declare(&parts);
+            return;
+        }
         let total = self.len as usize;
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let snapshot = before.get_or_insert_with(|| pooled(total));
@@ -1882,6 +2280,11 @@ impl Shadow {
         if self.place.is_some() {
             return 0;
         }
+        if self.nosnap.load(Ordering::Relaxed) {
+            let (from, to) = self.inside(address, len);
+            self.compared(from, to);
+            return if from < to { self.copy_back_nosnap(from, to) } else { 0 };
+        }
         let snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let mut written = 0;
         let (from, to) = self.inside(address, len);
@@ -1949,7 +2352,9 @@ impl Shadow {
                     *h = merged;
                 }
                 if differs != 0 {
-                    crate::watch::writing(start + at, n);
+                    // `write_mapped` writes translated pages itself
+                    // (`VICTORY_MEM2_GPU_ONLY_NOVIEW`): none is made a view.
+                    crate::watch::writing_soft(start + at, n);
                     crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
                     written += n;
                 }
@@ -2115,6 +2520,12 @@ impl Shadow {
             pending.retain(|r| !ranges.contains(r));
         }
         if !pending.is_empty() || self.card.is_some() {
+            return;
+        }
+        if self.nosnap.swap(false, Ordering::Relaxed) {
+            *self.pre.lock().unwrap_or_else(|e| e.into_inner()) = victory_core::mem2::PreImages::new();
+            drop(pending);
+            self.nosnap_forget();
             return;
         }
         if keeps() {
@@ -2789,6 +3200,14 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
         }
+        // With `crate::rebar` (level 2): a small one in the card's memory
+        // the CPU maps; never one the title reads on the CPU.
+        if !big
+            && let Some(shadow) = rebar_copy(crate::rebar::Kind::Buffer, key.0, len, size, false)
+        {
+            entry.shadow = Some(shadow);
+            return entry.shadow.clone();
+        }
         let (buffer, data) = host()?.shared_buffer(size)?;
         crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
         // A big one, with `cards`: shaders get a buffer in the card's own
@@ -2836,6 +3255,30 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         entry.shadow = Some(shadow);
     }
     entry.shadow.clone()
+}
+
+/// A copy of title memory `[start, start + len)` in a buffer of `size`
+/// bytes in the card's memory the CPU maps, if [`crate::rebar`] places it
+/// there (otherwise, or if the buffer cannot be made, `None`: the caller
+/// makes the copy as before). It is a plain copy (no card side): the CPU
+/// writes title memory straight into the card's memory.
+fn rebar_copy(kind: crate::rebar::Kind, start: u64, len: u64, size: u64, window: bool) -> Option<Arc<Shadow>> {
+    let cpu_read = crate::readback::tagged_in(start, len);
+    if !crate::rebar::reserve(kind, size, cpu_read) {
+        return None;
+    }
+    let Some((buffer, data)) = host().and_then(|h| h.gpu_upload_buffer(size)) else {
+        crate::rebar::released(size);
+        return None;
+    };
+    crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x} in the card's mapped memory"));
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+    tracing::debug!(start = format_args!("{start:#x}"), len, ?kind, "host copy in the card's mapped memory");
+    let mut shadow = Shadow::new(buffer, data, gpu, start, len);
+    shadow.window = window;
+    shadow.rebar = size;
+    Some(Arc::new(shadow))
 }
 
 /// Titles also use memory outside any buffer object as GPU memory (
@@ -3010,6 +3453,12 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         map.insert((start, len), shadow.clone());
         return Some(shadow);
     }
+    // With `crate::rebar`: in the card's memory the CPU maps.
+    if let Some(shadow) = rebar_copy(crate::rebar::Kind::Window, start, len, len, true) {
+        note(&shadow);
+        map.insert((start, len), shadow.clone());
+        return Some(shadow);
+    }
     let (buffer, data) = host()?.shared_buffer(len)?;
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
     // With room for windows on the card (`window_card_most`): shaders get a
@@ -3049,7 +3498,40 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
 
 #[cfg(test)]
 mod window_tests {
-    use super::{WINDOW, cover, grid, holder, longest_tail, tail_of, window_of};
+    use super::{
+        WINDOW, cover, default_card_limits_mb, grid, holder, longest_tail, resolve_card_limits,
+        tail_of, window_of,
+    };
+
+    #[test]
+    fn card_limits_scale_with_local_vram_budget() {
+        const GIB: u64 = 1 << 30;
+        const MIB: u64 = 1 << 20;
+
+        // Unknown (WARP / query failure) and <= 12 GiB keep the 12 GB baseline.
+        assert_eq!(default_card_limits_mb(None), (16, 512));
+        assert_eq!(default_card_limits_mb(Some(8 * GIB)), (16, 512));
+        assert_eq!(default_card_limits_mb(Some(11 * GIB)), (16, 512));
+        assert_eq!(default_card_limits_mb(Some(12 * GIB)), (16, 512));
+
+        // 16 GB tier (> 12 GiB, < 20 GiB), including WDDM budgets around 13.5–15 GiB.
+        assert_eq!(default_card_limits_mb(Some(13 * GIB)), (4, 2048));
+        assert_eq!(default_card_limits_mb(Some(14 * GIB)), (4, 2048));
+        assert_eq!(default_card_limits_mb(Some(15 * GIB)), (4, 2048));
+        assert_eq!(default_card_limits_mb(Some(16 * GIB)), (4, 2048));
+
+        // 24–32+ GB tier (>= 20 GiB): 1 MiB min, 25% of budget capped at 8192 MiB.
+        assert_eq!(default_card_limits_mb(Some(20 * GIB)), (1, 5120));
+        assert_eq!(default_card_limits_mb(Some(24 * GIB)), (1, 6144));
+        assert_eq!(default_card_limits_mb(Some(32 * GIB)), (1, 8192));
+        assert_eq!(default_card_limits_mb(Some(48 * GIB)), (1, 8192));
+
+        // Explicit env overrides always win, clamp min to >= 1 MiB, and saturate on overflow.
+        assert_eq!(resolve_card_limits(Some(32 * GIB), Some(8), Some(4096)), (8 * MIB, 4096 * MIB));
+        assert_eq!(resolve_card_limits(Some(12 * GIB), Some(0), Some(1024)), (MIB, 1024 * MIB));
+        assert_eq!(resolve_card_limits(None, Some(u64::MAX), Some(u64::MAX)), (u64::MAX, u64::MAX));
+        assert_eq!(resolve_card_limits(None, None, None), (16 * MIB, 512 * MIB));
+    }
 
     /// An ask that may take any window takes the longest that holds all of
     /// it, and none that holds only a part.
@@ -3150,6 +3632,18 @@ mod window_tests {
             assert!(start <= address && start + len >= end);
             assert!(start % g == 0 && len % g == 0);
         }
+    }
+
+    #[test]
+    fn snapshot_pool_cap_scales_with_ram() {
+        const GIB: u64 = 1 << 30;
+        const MIB: usize = 1 << 20;
+        assert_eq!(super::snapshot_pool_cap(None), 512 * MIB);
+        assert_eq!(super::snapshot_pool_cap(Some(2 * GIB)), 128 * MIB);
+        assert_eq!(super::snapshot_pool_cap(Some(8 * GIB)), 256 * MIB);
+        assert_eq!(super::snapshot_pool_cap(Some(16 * GIB)), 512 * MIB);
+        assert_eq!(super::snapshot_pool_cap(Some(32 * GIB)), 1024 * MIB);
+        assert_eq!(super::snapshot_pool_cap(Some(64 * GIB)), 1024 * MIB);
     }
 }
 

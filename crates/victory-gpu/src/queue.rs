@@ -324,7 +324,9 @@ pub(crate) fn release_held(all: bool) {
                 match held.first() {
                     None => break,
                     Some(&Held::Wait(fence, value))
-                        if !all && crate::fence::completed(fence as This) < value =>
+                        if !all
+                            && crate::fence::completed(fence as This) < value
+                            && !crate::host::late_signal_queued(fence, value) =>
                     {
                         break;
                     }
@@ -719,6 +721,10 @@ impl Written {
             }
             Written::SystemTimestamp => system_timestamp(),
         };
+        // Copies compared with title memory (`VICTORY_MEM2_GPU_ONLY_NOSNAP`)
+        // keep the bytes from before this write.
+        #[cfg(windows)]
+        crate::shadow::title_will_change(at as usize, bytes);
         // SAFETY: the title names writable GPU memory (unified with ours).
         unsafe {
             if bytes == 4 {
@@ -762,6 +768,9 @@ extern "system" fn present(
 ) -> HRESULT {
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::copystat::present_begins();
+    // Read-back copy-backs old enough are done before the frame goes.
+    #[cfg(windows)]
+    crate::host::async_present();
     // Submissions sent to the card and not waited for are settled first,
     // and what that frees runs in its own order, before anything is forced.
     #[cfg(windows)]
@@ -779,6 +788,14 @@ extern "system" fn present(
     #[cfg(windows)]
     release_held(forces());
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+    if let Some(line) = victory_core::fastboot::frame_presented() {
+        tracing::warn!("{line}");
+    }
+    // The title's frame this flips, for its statistics.
+    // SAFETY: the title passes `planes` plane descriptions.
+    if planes > 0 && let Some(plane) = unsafe { plane_parameters.as_ref() } {
+        crate::frame::flipped(plane.token);
+    }
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
         #[cfg(windows)]
@@ -828,7 +845,21 @@ extern "system" fn present(
         const COPY_SOURCE: u32 = 0x800;
         let state = crate::resource::host_transition(resource, COPY_SOURCE)
             .map_or(COPY_SOURCE, |(_, before)| before);
-        let shown = host.present(texture, state, frame);
+        // A second plane (the title's interface over its game image, in
+        // its Series S mode) is drawn over the first: `crate::over`. Each
+        // plane's description is 0x48 bytes and starts as the first does.
+        const READABLE: u32 = 0x80;
+        // SAFETY: the title passes `planes` plane descriptions.
+        let second = unsafe { second_plane(planes, plane_parameters, resource) }
+            .and_then(|r| Some((r, crate::resource::host_resource(r)?)));
+        let over = second.map(|(r, t)| {
+            let was = crate::resource::host_transition(r, READABLE).map_or(READABLE, |(_, before)| before);
+            (r, t, was)
+        });
+        let shown = host.present(texture, state, frame, over.map(|(_, t, was)| (t, was)));
+        if let Some((r, _, was)) = over {
+            crate::resource::host_transition(r, was);
+        }
         crate::resource::host_transition(resource, state);
         #[cfg(feature = "diagnostics")]
         blinks(frame, resource, state, shown);
@@ -839,6 +870,74 @@ extern "system" fn present(
     let _ = (planes, plane_parameters);
     S_OK
 }
+/// The bytes from one plane's description to the next in a present.
+const PLANE_STRIDE: usize = 0x48;
+
+/// The first resource of a present's second plane, if it has one that is not
+/// the first plane's (`first`): what is drawn over the first.
+///
+/// # Safety
+/// `parameters` is null or points at `planes` plane descriptions,
+/// [`PLANE_STRIDE`] bytes apart, each listing `count` resources.
+unsafe fn second_plane(planes: u32, parameters: *const Plane, first: This) -> Option<This> {
+    if planes < 2 || parameters.is_null() {
+        return None;
+    }
+    // SAFETY: the caller's: a second description follows the first.
+    let plane = unsafe { &*parameters.cast::<u8>().add(PLANE_STRIDE).cast::<Plane>() };
+    if plane.count == 0 || plane.resources.is_null() {
+        return None;
+    }
+    // SAFETY: the caller's: the plane lists `count` resources.
+    let resource = unsafe { *plane.resources };
+    (!resource.is_null() && resource != first).then_some(resource)
+}
+
+#[cfg(test)]
+mod plane_tests {
+    use super::*;
+
+    /// Two plane descriptions as a title lays them out, [`PLANE_STRIDE`]
+    /// bytes apart, the second naming `count` resources at `resources`.
+    fn two(count: u32, resources: *const This) -> [u64; 2 * PLANE_STRIDE / 8] {
+        let mut words = [0u64; 2 * PLANE_STRIDE / 8];
+        let second = PLANE_STRIDE / 8;
+        words[second] = 7; // frame token
+        words[second + 1] = u64::from(count);
+        words[second + 2] = resources as u64;
+        words
+    }
+
+    #[test]
+    fn the_second_plane_is_chosen_only_when_it_names_another_resource() {
+        let (a, b) = (0x1000 as This, 0x2000 as This);
+        let other = [b];
+        let same = [a];
+        let none = [std::ptr::null::<crate::object::Object>()];
+        // SAFETY: each description is a whole local array laid out as the
+        // title's; resource lists are local arrays of one.
+        unsafe {
+            let with_other = two(1, other.as_ptr());
+            let p = with_other.as_ptr().cast::<Plane>();
+            assert_eq!(second_plane(2, p, a), Some(b));
+            // One plane, or no descriptions at all: nothing over the first.
+            assert_eq!(second_plane(1, p, a), None);
+            assert_eq!(second_plane(0, p, a), None);
+            assert_eq!(second_plane(2, std::ptr::null(), a), None);
+            // The same resource twice is not drawn over itself.
+            let with_same = two(1, same.as_ptr());
+            assert_eq!(second_plane(2, with_same.as_ptr().cast(), a), None);
+            // An empty plane, a plane without a list, a null resource.
+            let empty = two(0, other.as_ptr());
+            assert_eq!(second_plane(2, empty.as_ptr().cast(), a), None);
+            let unlisted = two(1, std::ptr::null());
+            assert_eq!(second_plane(2, unlisted.as_ptr().cast(), a), None);
+            let with_null = two(1, none.as_ptr());
+            assert_eq!(second_plane(2, with_null.as_ptr().cast(), a), None);
+        }
+    }
+}
+
 /// Diagnostics: logs a presented frame that is black after one that was
 /// not, with what was presented and how many draws ran since.
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -919,6 +1018,40 @@ extern "system" fn copy_page_mappings(
         unsafe { std::slice::from_raw_parts(batches, count as usize) }
     });
     let mut ok = true;
+    if let Some(batch) = crate::resource::page_batch_mapper() {
+        // `VICTORY_PAGEMAP_RUNS`: the whole batch as one, in order.
+        use victory_core::pagemap::AliasOp;
+        let mut ops: Vec<AliasOp> = Vec::new();
+        for b in batches.into_iter().flatten() {
+            if b.ranges.is_null() {
+                continue;
+            }
+            // SAFETY: each batch holds `count` ranges.
+            let ranges = unsafe { std::slice::from_raw_parts(b.ranges, b.count as usize) };
+            let mut at = b.destination;
+            for r in ranges {
+                let len = u64::from(r.count) * PAGE;
+                let inside = |pages: u32| r.start.checked_add(pages).is_some_and(|e| e <= pool_pages);
+                let source = pool + u64::from(r.start) * PAGE;
+                match r.kind {
+                    0 if inside(r.count) => ops.push(AliasOp { to: at, from: Some(source), len, repeat: false }),
+                    1 if inside(1) => ops.push(AliasOp { to: at, from: Some(source), len, repeat: true }),
+                    2 => ops.push(AliasOp { to: at, from: None, len, repeat: false }),
+                    3 => {}
+                    _ => ok = false,
+                }
+                at += len;
+            }
+        }
+        ok &= batch(&ops);
+        if !ok {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| tracing::warn!(pool = format_args!("{pool:#x}"), "a page mapping failed"));
+        }
+        return S_OK;
+    }
+    #[cfg(windows)]
+    crate::watch::count_remap(5, 1);
     for b in batches.into_iter().flatten() {
         if b.ranges.is_null() {
             continue;
@@ -932,7 +1065,11 @@ extern "system" fn copy_page_mappings(
             let source = pool + u64::from(r.start) * PAGE;
             ok &= match r.kind {
                 0 if inside(r.count) => map(at, source, len),
-                1 if inside(1) => (0..u64::from(r.count)).all(|k| map(at + k * PAGE, source, PAGE)),
+                1 if inside(1) => {
+                    #[cfg(windows)]
+                    crate::watch::count_remap(14, u64::from(r.count));
+                    (0..u64::from(r.count)).all(|k| map(at + k * PAGE, source, PAGE))
+                }
                 2 => map(at, 0, len),
                 3 => true,
                 _ => false,

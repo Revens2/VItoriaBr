@@ -8,7 +8,14 @@
 //! from the previous version), flushed to disk, and one directory rename
 //! commits it (`v<N>`); the highest committed version is the container.
 //! A crash leaves the old version or the new one, never a mix; leftovers
-//! are removed on sight. Deleting a container renames it away first.
+//! are removed on sight, as far as the host lets them go (a scanner's brief
+//! hold on a folder, error 32, is retried and then left for later; it never
+//! blocks a read or a save). Deleting a container renames it away first.
+//!
+//! Each commit is also backed up (`victory_core::backup`, the last ten per
+//! container, hard-linked so they cost nothing), and each blob saved or
+//! loaded is logged with its container, size and outcome. `victory saves
+//! restore` brings a backup back as a new version.
 //!
 //! Names are exact: a version's `manifest` holds the container's name, its
 //! display name and the blob names (blob `i` is the file `i`), so case,
@@ -20,7 +27,6 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::ffi::{CString, c_char, c_void};
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -28,6 +34,8 @@ use super::xasync::{self, AsyncBlock, E_INVALIDARG};
 use super::xgameruntime::{
     Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing, put, text,
 };
+use victory_core::{atomic, backup};
+
 use super::{storage, xuser};
 use crate::runtime;
 
@@ -135,6 +143,7 @@ fn valid_container(name: &str) -> bool {
 /// A committed version of a container.
 struct Version {
     dir: PathBuf,
+    #[cfg_attr(not(test), allow(dead_code))]
     number: u64,
     name: String,
     display: String,
@@ -177,38 +186,70 @@ fn parse_manifest(bytes: &[u8]) -> Option<Vec<String>> {
     (out.len() >= 2).then_some(out)
 }
 
+/// Removes leftovers (unfinished or older versions). Whatever cannot go now
+/// (a scanner or Explorer holds it, error 32) stays for the next time: it
+/// must never make the container unreadable or unsavable, as it once did.
+fn discard(path: &Path) {
+    if let Err(e) = atomic::remove_dir_all(path) {
+        tracing::debug!(path = %path.display(), %e, "game save: leftover not removed yet");
+    }
+}
+
+/// Reads the version folder `dir`'s manifest.
+fn read_version(dir: PathBuf, number: u64) -> std::io::Result<Version> {
+    let bad = || std::io::Error::new(std::io::ErrorKind::InvalidData, "bad save manifest");
+    let bytes = atomic::retry(|| std::fs::read(dir.join(MANIFEST)))?;
+    let mut names = parse_manifest(&bytes).ok_or_else(bad)?;
+    let blobs = names.split_off(2);
+    let [name, display] = <[String; 2]>::try_from(names).map_err(|_| bad())?;
+    Ok(Version {
+        dir,
+        number,
+        name,
+        display,
+        blobs,
+    })
+}
+
 /// The container's newest committed version, if any. Removes what a crash
-/// left: unfinished versions and older ones.
+/// left, as far as it can: unfinished versions and older ones. A newest
+/// version whose manifest is missing or damaged (the disk lost it, never a
+/// commit: those are one rename) is set aside as `v<N>.bad` and the one
+/// before it is used.
 fn current(dir: &Path) -> std::io::Result<Option<Version>> {
     let mut committed = Vec::new();
     for entry in std::fs::read_dir(dir)?.flatten() {
         let file = entry.file_name();
         let file = file.to_string_lossy();
         if file.ends_with(".new") {
-            std::fs::remove_dir_all(entry.path())?;
+            discard(&entry.path());
         } else if let Some(n) = file.strip_prefix('v').and_then(|n| n.parse::<u64>().ok()) {
             committed.push(n);
         }
     }
     committed.sort_unstable();
-    let Some(&number) = committed.last() else {
-        return Ok(None);
-    };
-    for old in &committed[..committed.len() - 1] {
-        std::fs::remove_dir_all(dir.join(format!("v{old}")))?;
+    while let Some(number) = committed.pop() {
+        let folder = dir.join(format!("v{number}"));
+        match read_version(folder.clone(), number) {
+            Ok(version) => {
+                for old in committed {
+                    discard(&dir.join(format!("v{old}")));
+                }
+                return Ok(Some(version));
+            }
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::InvalidData | std::io::ErrorKind::NotFound) => {
+                tracing::error!(
+                    dir = %folder.display(), %e,
+                    "game save: this version is unreadable, setting it aside; `victory saves restore` brings back a backup"
+                );
+                let bad = dir.join(format!("v{number}.bad"));
+                discard(&bad);
+                let _ = atomic::rename(&folder, &bad);
+            }
+            Err(e) => return Err(e),
+        }
     }
-    let version = dir.join(format!("v{number}"));
-    let bad = || std::io::Error::new(std::io::ErrorKind::InvalidData, "bad save manifest");
-    let mut names = parse_manifest(&std::fs::read(version.join(MANIFEST))?).ok_or_else(bad)?;
-    let blobs = names.split_off(2);
-    let [name, display] = <[String; 2]>::try_from(names).map_err(|_| bad())?;
-    Ok(Some(Version {
-        dir: version,
-        number,
-        name,
-        display,
-        blobs,
-    }))
+    Ok(None)
 }
 
 /// The version of container `name` in `dir`; none for a missing container
@@ -241,16 +282,17 @@ fn commit(
     display: &str,
     blobs: &[(&str, Source<'_>)],
 ) -> std::io::Result<()> {
-    let staged = dir.join(format!("v{number}.new"));
-    if staged.exists() {
-        std::fs::remove_dir_all(&staged)?;
+    // A leftover staging folder that cannot be removed (a scanner holds it)
+    // is not in the way: stage under another name.
+    let mut staged = dir.join(format!("v{number}.new"));
+    for n in 1..=8 {
+        if !staged.exists() || atomic::remove_dir_all(&staged).is_ok() {
+            break;
+        }
+        staged = dir.join(format!("v{number}.{n}.new"));
     }
     std::fs::create_dir_all(&staged)?;
-    let write = |path: PathBuf, data: &[u8]| -> std::io::Result<()> {
-        let mut file = std::fs::File::create(path)?;
-        file.write_all(data)?;
-        file.sync_all()
-    };
+    let write = |path: PathBuf, data: &[u8]| atomic::write_synced(&path, data);
     for (i, (_, source)) in blobs.iter().enumerate() {
         let path = staged.join(i.to_string());
         match source {
@@ -264,9 +306,24 @@ fn commit(
     let names: Vec<&str> = blobs.iter().map(|(n, _)| *n).collect();
     write(staged.join(MANIFEST), &manifest(name, display, &names))?;
     step();
-    std::fs::rename(&staged, dir.join(format!("v{number}")))?;
+    // The one step that commits (retried over a scanner's brief hold).
+    if let Err(e) = atomic::rename(&staged, &dir.join(format!("v{number}"))) {
+        discard(&staged);
+        return Err(e);
+    }
     step();
     Ok(())
+}
+
+/// The number the next version of the container in `dir` takes: above every
+/// version folder there, readable or not.
+fn next_number(dir: &Path) -> u64 {
+    let numbers = std::fs::read_dir(dir).into_iter().flatten().flatten().filter_map(|e| {
+        let file = e.file_name();
+        let file = file.to_string_lossy();
+        file.strip_prefix('v')?.split('.').next()?.parse::<u64>().ok()
+    });
+    numbers.max().map_or(1, |n| n + 1)
 }
 
 /// The containers under a provider's root, by exact name; containers in
@@ -368,11 +425,33 @@ impl Provider {
     fn open(saves: &Path, config: Option<&str>) -> Result<Provider, HRESULT> {
         let config = config.filter(|c| !c.is_empty()).unwrap_or("default");
         let root = saves
-            .join(format!("{:016X}", xuser::XUID))
+            .join(format!("{:016X}", xuser::xuid()))
             .join(file_name(config));
         std::fs::create_dir_all(&root).map_err(|_| NO_ACCESS)?;
         let _saves = saves_lock();
-        containers(&root); // converts old containers now
+        let mine = containers(&root).len(); // converts old containers now
+        let profile = xuser::profile();
+        tracing::info!(
+            gamertag = %profile.gamertag, xuid = format!("{:016X}", profile.xuid),
+            config, containers = mine, root = %root.display(),
+            "game save provider: this profile's saves"
+        );
+        if mine == 0 {
+            // A new profile id starts a fresh game (the legal screens, the
+            // settings): say so when other profiles here do have saves.
+            let me = format!("{:016X}", profile.xuid);
+            let others: Vec<String> = backup::inspect(saves)
+                .into_iter()
+                .filter(|p| !p.user.eq_ignore_ascii_case(&me) && !p.containers.is_empty())
+                .map(|p| format!("{} ({} containers)", p.user, p.containers.len()))
+                .collect();
+            if !others.is_empty() {
+                tracing::warn!(
+                    xuid = %me, others = others.join(", "),
+                    "game save provider: this profile has no saves, but others do; if that is not intended, check VICTORY_PROFILE and profiles.txt"
+                );
+            }
+        }
         Ok(Provider { root })
     }
 
@@ -411,6 +490,23 @@ fn no_room(written: u64, replaced: u64, used: u64, free: u64) -> Option<HRESULT>
     }
 }
 
+/// One line for each blob saved, deleted or loaded (and each container
+/// deleted): the profile, container, blob, bytes and the outcome. A missing
+/// container or blob is normal on a fresh profile and logged as info.
+fn log_io(op: &str, container: &str, blob: &str, bytes: usize, hr: HRESULT) {
+    let user = format!("{:016X}", xuser::xuid());
+    if hr >= 0 {
+        tracing::info!(op, user, container, blob, bytes, result = "ok", "game save io");
+    } else {
+        let hr_text = format!("{:#010x}", hr as u32);
+        if hr == BLOB_NOT_FOUND {
+            tracing::info!(op, user, container, blob, bytes, result = "err", hr = hr_text, "game save io: not found");
+        } else {
+            tracing::warn!(op, user, container, blob, bytes, result = "err", hr = hr_text, "game save io");
+        }
+    }
+}
+
 fn io_error(dir: &Path, e: &std::io::Error) -> HRESULT {
     tracing::warn!(dir = %dir.display(), %e, "game save");
     if e.kind() == std::io::ErrorKind::StorageFull {
@@ -421,8 +517,21 @@ fn io_error(dir: &Path, e: &std::io::Error) -> HRESULT {
 }
 
 impl Update {
-    /// Applies the update as one new version of the container.
+    /// Applies the update as one new version of the container, and logs
+    /// every blob it wrote or deleted with the outcome.
     fn submit(&self) -> HRESULT {
+        let hr = self.apply();
+        for (blob, data) in &self.changes {
+            let (op, bytes) = data.as_ref().map_or(("save-delete", 0), |d| ("save", d.len()));
+            log_io(op, &self.name, blob, bytes, hr);
+        }
+        if self.changes.is_empty() {
+            log_io("save", &self.name, "", 0, hr);
+        }
+        hr
+    }
+
+    fn apply(&self) -> HRESULT {
         let _saves = saves_lock();
         let current = match current(&self.dir) {
             Ok(v) => v,
@@ -470,21 +579,42 @@ impl Update {
         }
         let display = self.display.as_deref();
         let display = display.or(current.as_ref().map(|v| v.display.as_str()));
-        let number = current.as_ref().map_or(1, |v| v.number + 1);
+        let number = next_number(&self.dir);
         if let Err(e) = commit(&self.dir, number, &self.name, display.unwrap_or(""), &blobs) {
             return io_error(&self.dir, &e);
         }
+        // The rolling backup of what was just committed. A failure is
+        // reported, never fails the save.
+        let version = self.dir.join(format!("v{number}"));
+        match backup::snapshot(&self.dir, &version, number, backup::KEEP) {
+            Ok(path) => tracing::debug!(
+                container = %self.name, version = number, backup = %path.display(),
+                "game save: backed up"
+            ),
+            Err(e) => tracing::warn!(
+                container = %self.name, version = number, %e,
+                "game save: the backup of this version failed"
+            ),
+        }
+        step();
         // The old version is garbage now; a crash here leaves it for later.
         if let Some(old) = &current {
-            let _ = std::fs::remove_dir_all(&old.dir);
+            discard(&old.dir);
             step();
         }
         S_OK
     }
 }
 
-/// Deletes a container: renamed away (one step), then removed.
+/// Deletes a container (logged): renamed away, then removed.
 fn delete(root: &Path, name: &str) -> HRESULT {
+    let hr = delete_container(root, name);
+    log_io("delete-container", name, "", 0, hr);
+    hr
+}
+
+/// Renamed away (one step), then removed.
+fn delete_container(root: &Path, name: &str) -> HRESULT {
     let _saves = saves_lock();
     let dir = container_dir(root, name);
     match current_named(&dir, name) {
@@ -503,8 +633,19 @@ fn delete(root: &Path, name: &str) -> HRESULT {
     S_OK
 }
 
-/// Reads the named blobs (all of them for `None`) of a container.
+/// Reads the named blobs (all of them for `None`) of a container, and logs
+/// each blob loaded, or why none was.
 fn read(c: &Container, names: Option<Vec<String>>) -> Result<Vec<(String, Vec<u8>)>, HRESULT> {
+    let asked = names.as_ref().map_or_else(|| "*".to_owned(), |n| n.join(","));
+    let result = read_blobs_of(c, names);
+    match &result {
+        Ok(blobs) => blobs.iter().for_each(|(name, data)| log_io("load", &c.name, name, data.len(), S_OK)),
+        Err(hr) => log_io("load", &c.name, &asked, 0, *hr),
+    }
+    result
+}
+
+fn read_blobs_of(c: &Container, names: Option<Vec<String>>) -> Result<Vec<(String, Vec<u8>)>, HRESULT> {
     let _saves = saves_lock();
     let version = current_named(&c.dir, &c.name)
         .map_err(|e| io_error(&c.dir, &e))?
@@ -937,7 +1078,7 @@ static VTABLE: Methods<30> = Methods([
 
 #[cfg(test)]
 mod tests {
-    use std::io::BufRead;
+    use std::io::{BufRead, Write as _};
     use std::sync::atomic::{AtomicU32, Ordering};
 
     use super::*;
@@ -1069,6 +1210,54 @@ mod tests {
         }
     }
 
+    /// Each commit leaves a backup, the last ten stay, and one of them brings
+    /// a container back after the live copy is gone or ruined.
+    #[test]
+    fn every_commit_is_backed_up_and_restorable() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for i in 1..=12 {
+            let data = format!("save {i}");
+            assert_eq!(update(root, "d", &[("a", Some(&data))]), S_OK);
+        }
+        let container = container_dir(root, "Slot");
+        let dir_of_backups = backup::dir_of(&container).unwrap();
+        let backups = backup::list(&dir_of_backups);
+        assert_eq!(backups.len(), backup::KEEP);
+        assert_eq!(backups[0].version, 12);
+        let blob = |b: &backup::Backup| std::fs::read_to_string(b.path.join("0")).unwrap();
+        assert_eq!(blob(&backups[0]), "save 12");
+        assert_eq!(blob(&backups[9]), "save 3");
+
+        // The live copy is ruined (every version folder gone).
+        for entry in std::fs::read_dir(&container).unwrap().flatten() {
+            std::fs::remove_dir_all(entry.path()).unwrap();
+        }
+        assert_eq!(state(root), None);
+        backup::restore(&container, &backups[2], backup::KEEP).unwrap();
+        assert_eq!(state(root), Some(("d".into(), vec![("a".into(), "save 10".into())])));
+        // Saving goes on from there, and the restore stays undoable.
+        assert_eq!(update(root, "d", &[("a", Some("save 13"))]), S_OK);
+        assert_eq!(state(root).unwrap().1[0].1, "save 13");
+    }
+
+    /// A newest version whose manifest is gone is set aside and the one
+    /// before it is used; a version number is never reused.
+    #[test]
+    fn a_damaged_newest_version_falls_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert_eq!(update(root, "d", &[("a", Some("good"))]), S_OK);
+        let container = container_dir(root, "Slot");
+        std::fs::create_dir_all(container.join("v9")).unwrap();
+        std::fs::write(container.join("v9/0"), "no manifest").unwrap();
+        assert_eq!(state(root).unwrap().1[0].1, "good");
+        assert!(container.join("v9.bad").is_dir() && !container.join("v9").exists());
+        assert_eq!(update(root, "d", &[("a", Some("better"))]), S_OK);
+        assert_eq!(state(root).unwrap().1[0].1, "better");
+        assert_eq!(next_number(&container), 11);
+    }
+
     #[test]
     fn names_are_exact() {
         for name in ["Save_1", "slot/2", "a.b c%", "\u{e9}t\u{e9}"] {
@@ -1121,7 +1310,7 @@ mod tests {
     #[test]
     fn the_old_layout_moves_over() {
         let saves = tempfile::tempdir().unwrap();
-        let root = saves.path().join(format!("{:016X}", xuser::XUID)).join("scid");
+        let root = saves.path().join(format!("{:016X}", xuser::xuid())).join("scid");
         let old = root.join("Player");
         std::fs::create_dir_all(&old).unwrap();
         std::fs::write(old.join("Save%20Game%20Data"), b"data").unwrap();
