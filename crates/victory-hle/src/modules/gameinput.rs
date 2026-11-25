@@ -684,9 +684,11 @@ fn live_press(keys: &mut Vec<KeyState>) {
     }
 }
 
-/// VICTORY_FAST_BOOT (testing only): A on every other presented frame, and
-/// START on one frame in eight (skips cutscenes), from the first frame until
-/// the title is in the world; then nothing, for good.
+/// VICTORY_FAST_BOOT (testing only): A on every other presented frame, from
+/// the first frame until the title is in the world; then nothing, for good.
+/// With `VICTORY_SKIP_CUTSCENES=1` also START on one frame in eight (a press
+/// the title takes late opens the pause menu in the world, which then
+/// stays).
 fn fast_boot_keys(keys: &mut Vec<KeyState>) {
     let key = |scan: u16, vk: u8| KeyState {
         scan_code: scan.into(),
@@ -709,7 +711,7 @@ fn fast_boot_keys(keys: &mut Vec<KeyState>) {
     let frame = victory_core::fastboot::frame();
     if frame % 2 == 0 {
         keys.push(key(0x1C, 0x0D));
-    } else if frame % 8 == 1 {
+    } else if frame % 8 == 1 && victory_core::fastboot::skip_cutscenes() {
         keys.push(key(0x01, 0x1B));
     }
 }

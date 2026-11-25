@@ -60,9 +60,13 @@ pub fn active() -> bool {
 /// The world was detected less than [`SKIP_SECONDS`] ago: A is still
 /// pressed so the intro cutscene's skip prompt takes it.
 pub fn skipping() -> bool {
+    skip_cutscenes() && WORLD_AT.get().is_some_and(|t| t.elapsed().as_secs() < SKIP_SECONDS)
+}
+
+/// `VICTORY_SKIP_CUTSCENES=1`.
+pub fn skip_cutscenes() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| truthy(crate::env::env("VICTORY_SKIP_CUTSCENES")))
-        && WORLD_AT.get().is_some_and(|t| t.elapsed().as_secs() < SKIP_SECONDS)
 }
 
 /// Presented frames seen so far (while fast boot is on).
