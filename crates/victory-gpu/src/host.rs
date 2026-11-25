@@ -847,6 +847,49 @@ mod tests {
         }
     }
 
+    /// Joined title copies move what the copies would have moved one by
+    /// one: all of it when every page is there; where a destination page
+    /// is not, the copy that holds it is left alone and the others are
+    /// made, as when each was its own step.
+    #[test]
+    fn joined_copies_end_as_the_copies_one_by_one() {
+        use windows_sys::Win32::System::Memory::*;
+        const P: usize = 1 << 16;
+        // SAFETY: a private region of ours, three blocks reserved; only
+        // committed pages are touched directly.
+        unsafe {
+            let src: Vec<u8> = (0..3 * P).map(|i| (i % 251) as u8 + 1).collect();
+            // (bytes of each copy) recorded one after the other.
+            let parts = [P - 100, 100 + 4096, P - 4096, P];
+            assert_eq!(parts.iter().sum::<usize>(), 3 * P);
+            for hole in [false, true] {
+                let base = VirtualAlloc(std::ptr::null(), 3 * P, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+                assert!(!base.is_null());
+                for block in 0..3 {
+                    if hole && block == 1 {
+                        continue;
+                    }
+                    let at = base.add(block * P);
+                    assert_eq!(VirtualAlloc(at.cast(), P, MEM_COMMIT, PAGE_READWRITE), at.cast());
+                }
+                super::copy_joined(base as usize, src.as_ptr() as usize, &parts);
+                // Every copy that does not meet the hole is made, the one
+                // after it too. A copy that meets it is left alone; its
+                // pages before the hole may hold what the kernel wrote
+                // before it stopped, as a single copy's attempt leaves them.
+                let mut at = 0;
+                for (i, &n) in parts.iter().enumerate() {
+                    if !(hole && at < 2 * P && at + n > P) {
+                        let got = std::slice::from_raw_parts(base.add(at), n);
+                        assert_eq!(got, &src[at..at + n], "hole {hole} copy {i}");
+                    }
+                    at += n;
+                }
+                assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
+            }
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -2043,8 +2086,10 @@ struct CardPlan {
 /// One piece of submission-time work, in recorded order.
 enum Step {
     /// A copy into title memory (destination, source, bytes): the title's
-    /// buffer copies, which later refreshes must see.
-    Copy(usize, usize, usize),
+    /// buffer copies, which later refreshes must see. With copies joined
+    /// ([`join_copies`]) the bytes of each copy recorded, in order (empty
+    /// for one copy alone): a joined copy that fails goes copy by copy.
+    Copy(usize, usize, usize, Vec<usize>),
     /// A copy of title memory into the list's own upload memory.
     Fill(usize, usize, usize),
     /// Brings a range (address, bytes) of a buffer's host copy up to date:
@@ -2743,7 +2788,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
     for list in runs {
         for step in &list.deferred().copies {
             match step {
-                &Step::Copy(dst, src, len) => {
+                &Step::Copy(dst, src, len, _) => {
                     if touches(written, src, src + len) || touches(written, dst, dst + len) {
                         // A copy that only READS where flights may write is
                         // not waited for either, and checked like a fill
@@ -3739,8 +3784,8 @@ mod late_tests {
 }
 
 /// Whether a title buffer copy that continues the one recorded before it
-/// in its list becomes one step with it (`VICTORY_JOIN_COPIES=1`; off by
-/// default).
+/// in its list becomes one step with it (on by default;
+/// `VICTORY_JOIN_COPIES=0` keeps every copy a step of its own, as before).
 ///
 /// Each copy is done at submission through the kernel, which reports a
 /// page that is not there instead of faulting (`copy_mapped`), tells the
@@ -3752,13 +3797,14 @@ mod late_tests {
 ///
 /// Joined, the same bytes move: [`continues`] joins only copies whose
 /// ranges, taken together, do not overlap, and nothing is recorded between
-/// two steps that follow each other. What differs: a page that is not
-/// mapped now fails the joined copy as a whole (it then goes page by page,
-/// zeros for what cannot be read, as a single copy does), where before
-/// only the copy that held it did.
+/// two steps that follow each other (the refreshes a copy ends are ended
+/// by the first). A joined copy that fails (a page of either side is not
+/// there) is made again copy by copy ([`copy_joined`]), each as it would
+/// have been alone: a destination not all mapped leaves that copy alone
+/// and no other.
 fn join_copies() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_JOIN_COPIES").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_JOIN_COPIES").is_none_or(|v| v != "0"))
 }
 
 /// Since the last frame-rate line: title buffer copies recorded, and those
@@ -6829,18 +6875,22 @@ impl HostList {
         // A copy that goes on where the one recorded just before it ended,
         // source and destination both: with `join_copies` the two are one
         // step.
-        if let Some(Step::Copy(d, s, n)) = deferred.copies.last_mut()
+        if let Some(Step::Copy(d, s, n, parts)) = deferred.copies.last_mut()
             && continues((*d, *s, *n), (dst as usize, src as usize, len))
         {
             COPIES_JOINED[1].fetch_add(1, Ordering::Relaxed);
             if join_copies() {
+                if parts.is_empty() {
+                    parts.push(*n);
+                }
+                parts.push(len);
                 *n += len;
                 return;
             }
         }
         deferred
             .copies
-            .push(Step::Copy(dst as usize, src as usize, len));
+            .push(Step::Copy(dst as usize, src as usize, len, Vec::new()));
         deferred.refreshed.clear();
     }
 
@@ -7356,7 +7406,8 @@ impl HostList {
         for step in &self.deferred().copies {
             let started = std::time::Instant::now();
             let copied = match step {
-                &Step::Copy(dst, src, len) => {
+                Step::Copy(dst, src, len, parts) => {
+                    let (dst, src, len) = (*dst, *src, *len);
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Copies, 1);
@@ -7365,7 +7416,11 @@ impl HostList {
                     batch.title_wrote(dst, len);
                     #[cfg(feature = "diagnostics")]
                     fill_check::copy_runs(dst, src, len);
-                    copy_mapped(dst as *mut u8, src as *const u8, len, true);
+                    if parts.is_empty() {
+                        copy_mapped(dst as *mut u8, src as *const u8, len, true);
+                    } else {
+                        copy_joined(dst, src, parts);
+                    }
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);
                     len
@@ -7906,9 +7961,7 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     // time in gameplay (run 60: 71 of 500 looks). The kernel's copy below
     // says the same when it fails, so the question is only asked then.
     // `VICTORY_COPY_ASK=1` asks first, as before.
-    static ASK: OnceLock<bool> = OnceLock::new();
-    let ask_first = title_dst
-        && *ASK.get_or_init(|| std::env::var_os("VICTORY_COPY_ASK").is_some_and(|v| v == "1"));
+    let ask_first = title_dst && copy_ask();
     if ask_first && !crate::texture::committed(dst, len) {
         return;
     }
@@ -7953,6 +8006,43 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::SparseUs, sparse.elapsed().as_micros() as u64);
+}
+
+/// `VICTORY_COPY_ASK=1`: a copy into title memory asks first whether the
+/// destination is all mapped ([`copy_mapped`]).
+fn copy_ask() -> bool {
+    static ASK: OnceLock<bool> = OnceLock::new();
+    *ASK.get_or_init(|| std::env::var_os("VICTORY_COPY_ASK").is_some_and(|v| v == "1"))
+}
+
+/// Title buffer copies recorded one after the other that continue each
+/// other ([`join_copies`]): `parts` bytes each, from `src` to `dst`, as one
+/// call into the kernel. Where that fails (a page of either side is not
+/// there) each copy is made on its own with [`copy_mapped`], as it was
+/// recorded: a destination not all mapped leaves only that copy alone.
+fn copy_joined(dst: usize, src: usize, parts: &[usize]) {
+    let len: usize = parts.iter().sum();
+    #[cfg(feature = "diagnostics")]
+    let plain = crate::copystat::mode() != 0;
+    #[cfg(not(feature = "diagnostics"))]
+    let plain = false;
+    if !plain && !copy_ask() && len > 0 {
+        // The kernel writes the destination: it must not be guarded.
+        crate::watch::writing(dst, len);
+        #[cfg(feature = "diagnostics")]
+        let moved = std::time::Instant::now();
+        let whole = read(src as *const u8, dst as *mut u8, len);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
+        if whole {
+            return;
+        }
+    }
+    let mut at = 0;
+    for &n in parts {
+        copy_mapped((dst + at) as *mut u8, (src + at) as *const u8, n, true);
+        at += n;
+    }
 }
 
 /// After a failed bulk read into host memory, skip contiguous holes. Never
@@ -8392,7 +8482,7 @@ impl Meter {
             if copies > 0.0 {
                 tracing::info!(
                     "title buffer copies recorded per frame: {copies:.0}, of them {joined:.0} continue the one before \
-                     (VICTORY_JOIN_COPIES=1 makes those one copy with it: now {})",
+                     (VICTORY_JOIN_COPIES=0 keeps them apart: joined now {})",
                     if join_copies() { "on" } else { "off" }
                 );
             }
