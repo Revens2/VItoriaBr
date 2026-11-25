@@ -5110,6 +5110,7 @@ mod card_merge_tests {
                 before: Mutex::new(None),
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
+                queued: std::sync::atomic::AtomicBool::new(false),
                 masked: Mutex::new(super::Masked {
                     pending: bits(&[(waiting, waiting + 1)]),
                     sent: vec![
