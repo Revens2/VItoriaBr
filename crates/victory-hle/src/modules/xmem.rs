@@ -778,7 +778,13 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
     let pages = (!pages.is_null()).then(|| unsafe { std::slice::from_raw_parts(pages, n) });
 
     let mut physical = physical();
-    let _changing = victory_gpu::title_memory_remapping();
+    let (low, high) = addrs
+        .iter()
+        .map(|&a| a as usize)
+        .filter(|&a| a != 0)
+        .fold((usize::MAX, 0), |(lo, hi), a| (lo.min(a), hi.max(a)));
+    let span = if low <= high { reach(&physical, low, high + PAGE - low) } else { (0, 0) };
+    let _changing = victory_gpu::title_memory_remapping(span.0, span.1 - span.0);
 
     for i in 0..n {
         let addr = addrs[i] as usize;
