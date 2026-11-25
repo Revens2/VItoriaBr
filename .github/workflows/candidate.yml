@@ -228,7 +228,7 @@ jobs:
         timeout-minutes: 55
         shell: python -I {0}
         run: |
-          import json, os, re, subprocess, sys, threading, time, urllib.request
+          import concurrent.futures, json, os, re, subprocess, sys, threading, time, urllib.request
           sys.stdout.reconfigure(encoding="utf-8", errors="replace")
           out = os.path.join(os.environ["RUNNER_TEMP"], "cand")
           path = os.path.join(out, "result.json")
@@ -247,7 +247,8 @@ jobs:
           timer.start()
           failed, skipped, excerpts, slow, crashed = [], {}, {}, [], []
           totals = {"passed": 0, "failed": 0, "ignored": 0}
-          target, open_target, section, block, in_list, compile_errors = None, False, None, None, False, []
+          target, open_target, section, block, compile_errors = None, False, None, None, []
+          binaries = {}
 
           def add(name):
               full = "%s::%s" % (target, re.sub(r" - should panic$", "", name))
@@ -269,10 +270,12 @@ jobs:
                       close()
                       if m:
                           stem = re.sub(r"-[0-9a-f]{16}(\.exe)?$", "", re.split(r"[\\/]", m.group(2))[-1])
-                          target = "%s[%s]" % (stem, m.group(1).replace("\\", "/"))
+                          src = m.group(1).replace("\\", "/")
+                          target = "%s[%s]" % (stem, src)
+                          binaries[target] = (m.group(2), stem, src)
                       else:
                           target = "doc:" + d.group(1)
-                      open_target, section, block, in_list = True, None, None, False
+                      open_target, section, block = True, None, None
                       continue
                   if re.match(r"error(\[E\d+\])?:", line) and len(compile_errors) < 40:
                       compile_errors.append(line)
@@ -284,11 +287,14 @@ jobs:
                       elif crashed and crashed[-1]["target"] == target:
                           crashed[-1]["detail"] = line.strip()[-300:]
                       continue
-                  r = re.match(r"test result: \w+\. (\d+) passed; (\d+) failed; (\d+) ignored", line)
+                  r = re.match(r"test result: \w+\. (\d+) passed; (\d+) failed; (\d+) ignored; "
+                               r"\d+ measured; (\d+) filtered out", line)
                   if r:
-                      for k, v in zip(("passed", "failed", "ignored"), r.groups()):
-                          totals[k] += int(v)
-                      open_target, section, block, in_list = False, None, None, False
+                      # Nothing is filtered here, so a filtered run is a test re-running its own binary.
+                      if r.group(4) == "0":
+                          for k, v in zip(("passed", "failed", "ignored"), r.groups()):
+                              totals[k] += int(v)
+                          open_target, section, block = False, None, None
                       continue
                   s = re.search(r"test (\S+) has been running for over", line)
                   if s:
@@ -299,7 +305,7 @@ jobs:
                       add(t.group(1))
                       continue
                   if line in ("successes:", "failures:"):
-                      section, block, in_list = line[:-1], None, False
+                      section, block = line[:-1], None
                       continue
                   h = re.match(r"---- (.+?) stdout ----$", line)
                   if h and section:
@@ -320,6 +326,91 @@ jobs:
           code = p.wait()
           timer.cancel()
           close()
+
+          # A binary that dies takes the rest of its tests with it: run each of them in its own process.
+          def isolate(entry):
+              name = entry["target"]
+              exe, stem, src = binaries[name]
+              exe = os.path.abspath(exe)
+              meta = json.loads(subprocess.run(
+                  ["cargo", "metadata", "--no-deps", "--locked", "--format-version", "1"],
+                  capture_output=True, text=True, encoding="utf-8", check=True).stdout)
+              cwd = next((os.path.dirname(pkg["manifest_path"]) for pkg in meta["packages"] for t in pkg["targets"]
+                          if t["name"].replace("-", "_") == stem.replace("-", "_")
+                          and t["src_path"].replace("\\", "/").endswith("/" + src)), os.getcwd())
+              env = {**os.environ, "CARGO_MANIFEST_DIR": cwd}
+
+              def listing(*extra):
+                  q = subprocess.run([exe, "--list", "--format", "terse", *extra], cwd=cwd, env=env,
+                                     capture_output=True, text=True, encoding="utf-8", errors="replace",
+                                     timeout=120, check=True)
+                  return [l[:-len(": test")] for l in q.stdout.splitlines() if l.endswith(": test")]
+
+              ignored = set(listing("--ignored"))
+              tests = [t for t in listing() if t not in ignored]
+
+              def one(test):
+                  if time.time() > start + 50 * 60:
+                      return test, "not_run", ""
+                  try:
+                      q = subprocess.run([exe, test, "--exact", "--test-threads=1", "--show-output"], cwd=cwd,
+                                         env=env, capture_output=True, text=True, encoding="utf-8",
+                                         errors="replace", timeout=180)
+                  except subprocess.TimeoutExpired:
+                      return test, "timeout", "no result after 180 s"
+                  text = q.stdout + q.stderr
+                  if q.returncode == 0:
+                      return test, "ok", text
+                  if q.returncode == 101:
+                      return test, "failed", text
+                  return test, "crashed", "exit code 0x%08x\n%s" % (q.returncode & 0xffffffff, text)
+
+              with concurrent.futures.ThreadPoolExecutor(4) as pool:
+                  outcomes = list(pool.map(one, tests))
+              prefix = name + "::"
+              failed[:] = [f for f in failed if not f.startswith(prefix)]
+              for table in (excerpts, skipped):
+                  for key in [k for k in table if k.startswith(prefix)]:
+                      del table[key]
+              count = {"passed": 0, "failed": 0, "ignored": len(ignored), "not_run": 0}
+              entry["crashed_tests"] = []
+              with open(os.path.join(out, "test.log"), "a", encoding="utf-8") as log:
+                  for test, state, text in outcomes:
+                      full = prefix + test
+                      line = "isolated %s ... %s" % (full, state)
+                      print(line, flush=True)
+                      log.write(line + "\n")
+                      if state == "ok":
+                          count["passed"] += 1
+                          own = text.partition("---- %s stdout ----" % test)[2].partition("successes:")[0]
+                          for l in own.splitlines():
+                              if re.search(r"(?i)\bskipp(ed|ing)\b", l):
+                                  skipped[full] = l.strip()[:200]
+                                  break
+                      elif state == "not_run":
+                          count["not_run"] += 1
+                      else:
+                          count["failed"] += 1
+                          failed.append(full)
+                          log.write(text + "\n")
+                          kept = [l[:300] for l in text.splitlines() if l and not l.startswith("running ")]
+                          excerpts[full] = kept[:12]
+                          if state != "failed":
+                              entry["crashed_tests"].append("%s (%s)" % (test, state))
+              entry["isolated"] = count
+              for k in ("passed", "failed", "ignored"):
+                  totals[k] += count[k]
+              if count["not_run"]:
+                  timed_out.append(True)
+
+          if not timed_out:
+              for entry in crashed:
+                  if entry["target"] in binaries:
+                      try:
+                          isolate(entry)
+                      except Exception as exc:
+                          entry["isolation_error"] = str(exc)[:300]
+                          print("::warning::could not isolate %s: %s" % (entry["target"], exc))
           res = json.load(open(path, encoding="utf-8"))
           ran = totals["passed"] + totals["failed"] + totals["ignored"]
           if timed_out:
@@ -365,8 +456,10 @@ jobs:
           if status in ("timeout", "compile_failed"):
               verdict = "tests_" + status
           elif comparison:
-              if comparison["new_failures"] or comparison["new_crashed_targets"]:
+              if comparison["new_failures"]:
                   verdict = "new_failures"
+              elif comparison["new_crashed_targets"]:
+                  verdict = "new_crash"
               elif status != "ok" and not (failed or crashed):
                   verdict = "tests_failed"
               else:
@@ -428,7 +521,9 @@ jobs:
               else:
                   md.append("no recorded reference for this base: compare with your own reference run")
               block("Failed tests", t["failed_tests"])
-              block("Crashed targets", ["%s %s" % (x["target"], x["detail"]) for x in t["crashed_targets"]])
+              block("Crashed targets (rerun test by test)", ["%s %s | isolated: %s | crashing alone: %s" % (
+                  x["target"], x["detail"], x.get("isolated", x.get("isolation_error", "not rerun")),
+                  ", ".join(x.get("crashed_tests", [])) or "none") for x in t["crashed_targets"]])
               block("Skipped at runtime (GPU, compiler)", ["%s: %s" % kv for kv in t["skipped_at_runtime"].items()])
               block("Test compile errors", t["compile_errors"])
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as f:
