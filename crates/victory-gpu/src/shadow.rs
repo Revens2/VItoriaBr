@@ -1908,6 +1908,17 @@ pub(crate) fn merged_stats() -> [u64; 3] {
     [0, 1, 2].map(|i| MERGED[i].swap(0, Ordering::Relaxed))
 }
 
+/// Since the last frame-rate line, why [`Shadow::merge_under_writes`] said
+/// the caller must settle: memory not write-watched, the journal could not
+/// say, a copy in the card's memory had more runs than `runs_left`, no
+/// snapshot. Counting only; nothing reads it but the frame-rate line.
+static STALE_WHY: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// [`STALE_WHY`], taken.
+pub(crate) fn stale_why_stats() -> [u64; 4] {
+    [0, 1, 2, 3].map(|i| STALE_WHY[i].swap(0, Ordering::Relaxed))
+}
+
 /// `runs` (in order) with those a gap of `gap` bytes or fewer apart made
 /// one run, the gap's bytes included.
 fn joined_over(runs: Vec<(usize, usize)>, gap: usize) -> Vec<(usize, usize)> {
@@ -3309,6 +3320,7 @@ impl Shadow {
             return false;
         }
         if self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
+            STALE_WHY[0].fetch_add(1, Ordering::Relaxed);
             return true;
         }
         let base = start / PAGE;
@@ -3323,6 +3335,7 @@ impl Shadow {
             let mut written = WRITTEN.take();
             let Some(now) = crate::watch::writes_into(a, e, true, &mut written) else {
                 WRITTEN.set(written);
+                STALE_WHY[1].fetch_add(1, Ordering::Relaxed);
                 return true;
             };
             let stale: Vec<usize> = {
@@ -3359,6 +3372,7 @@ impl Shadow {
                     let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
                     let runs = joined_over(changed_runs(title, held), merge_gap());
                     if runs.len() > *runs_left {
+                        STALE_WHY[2].fetch_add(1, Ordering::Relaxed);
                         return true;
                     }
                     *runs_left -= runs.len();
@@ -3370,6 +3384,7 @@ impl Shadow {
                     }
                 } else {
                     let Some(snapshot) = before.as_mut() else {
+                        STALE_WHY[3].fetch_add(1, Ordering::Relaxed);
                         return true;
                     };
                     // SAFETY: the snapshot's allocation holds the copy's

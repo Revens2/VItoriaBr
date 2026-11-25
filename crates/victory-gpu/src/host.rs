@@ -3748,9 +3748,11 @@ fn late_line(frames: f64) {
     }
     if late_exact() {
         let [pages, runs, bytes] = crate::shadow::merged_stats().map(|n| n as f64 / frames);
+        let [unwatched, journal, too_many_runs, no_snapshot] = crate::shadow::stale_why_stats().map(|n| n as f64 / frames);
         tracing::info!(
             "title bytes put in under flights' shader writes per frame (VICTORY_LATE_WAIT=2): {pages:.0} pages looked at, \
-             {runs:.0} changed runs, {:.2} MB",
+             {runs:.0} changed runs, {:.2} MB; to settle per frame: {unwatched:.2} not write-watched, {journal:.2} journal \
+             silent, {too_many_runs:.2} over the runs cap, {no_snapshot:.2} no snapshot",
             bytes / (1 << 20) as f64
         );
     }
