@@ -7479,7 +7479,7 @@ impl HostList {
                     continue;
                 }
                 Step::Texture(staging) => {
-                    if batch.texture_due(staging) {
+                    if batch.texture_due(staging, staging.memory()) {
                         if wide_textures() {
                             batch.textures_due.push(staging.clone());
                         } else {
@@ -7581,8 +7581,9 @@ struct Batch {
     /// brought up to date in this submission that no step of ours has
     /// written since.
     current: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
-    /// Staging buffers (by address) refreshed since the last title write.
-    textures: std::collections::HashSet<usize>,
+    /// Staging buffers (by address) refreshed since the last title write
+    /// to their memory, and that memory (start, end).
+    textures: std::collections::HashMap<usize, (usize, usize)>,
     /// With [`wide_textures`]: textures due, refreshed together at the next
     /// flush (before a step that writes title memory, and before the lists
     /// run), several at a time.
@@ -7668,12 +7669,14 @@ impl Batch {
 
     /// Whether `staging` is still to be refreshed in this submission (and
     /// notes it refreshed).
-    fn texture_due<T>(&mut self, staging: &std::sync::Arc<T>) -> bool {
-        self.textures.insert(std::sync::Arc::as_ptr(staging) as *const () as usize)
+    /// `memory` is the texture's title memory, (address, bytes).
+    fn texture_due<T>(&mut self, staging: &std::sync::Arc<T>, memory: (usize, usize)) -> bool {
+        let key = std::sync::Arc::as_ptr(staging) as *const () as usize;
+        self.textures.insert(key, (memory.0, memory.0.saturating_add(memory.1))).is_none()
     }
 
-    /// Before a step that writes title memory: pending refreshes are done
-    /// first, and textures are checked again after it.
+    /// Before a step that writes title memory where is not known: pending
+    /// refreshes are done first, and every texture is checked again after.
     fn title_written(&mut self) {
         self.flush();
         self.textures.clear();
@@ -7687,7 +7690,10 @@ impl Batch {
     /// beside them stays so.
     fn title_wrote(&mut self, at: usize, len: usize) {
         self.flush();
-        self.textures.clear();
+        // Only the textures whose memory the copy overlaps are checked again
+        // (FernandoHaeser/ztrx perf/30fps eea590f).
+        let end = at.saturating_add(len);
+        self.textures.retain(|_, &mut (from, to)| to <= at || end <= from);
         let end = at + len;
         self.current.retain(|_, entry| {
             let (from, to) = (entry.1, entry.2);
@@ -9361,33 +9367,63 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
     use super::Batch;
     use std::sync::Arc;
 
+    /// A texture's memory, for the tests that do not look at it.
+    const M: (usize, usize) = (0x1000, 0x100);
+
     #[test]
     fn a_texture_is_checked_once_per_submission() {
         let mut batch = Batch::default();
         let (a, b) = (Arc::new([0u8; 16]), Arc::new([0u8; 16]));
         // The first list sampling each texture checks it ...
-        assert!(batch.texture_due(&a));
-        assert!(batch.texture_due(&b));
+        assert!(batch.texture_due(&a, M));
+        assert!(batch.texture_due(&b, M));
         // ... later lists of the same submission do not.
-        assert!(!batch.texture_due(&a));
-        assert!(!batch.texture_due(&a.clone()));
-        assert!(!batch.texture_due(&b));
+        assert!(!batch.texture_due(&a, M));
+        assert!(!batch.texture_due(&a.clone(), M));
+        assert!(!batch.texture_due(&b, M));
     }
 
     #[test]
     fn title_writes_make_textures_due_again() {
         let mut batch = Batch::default();
         let a = Arc::new(1u32);
-        assert!(batch.texture_due(&a));
-        assert!(!batch.texture_due(&a));
-        // A copy into title memory or work that may write it may have
-        // changed the texture's memory.
+        assert!(batch.texture_due(&a, M));
+        assert!(!batch.texture_due(&a, M));
+        // Work that may write title memory anywhere may have changed the
+        // texture's memory.
         batch.title_written();
-        assert!(batch.texture_due(&a));
-        assert!(!batch.texture_due(&a));
+        assert!(batch.texture_due(&a, M));
+        assert!(!batch.texture_due(&a, M));
         // A fresh submission starts over.
         let mut next = Batch::default();
-        assert!(next.texture_due(&a));
+        assert!(next.texture_due(&a, M));
+    }
+
+    /// A copy into title memory makes due again only the textures whose
+    /// memory it overlaps.
+    #[test]
+    fn a_title_copy_makes_due_only_the_textures_it_writes() {
+        let mut batch = Batch::default();
+        let (a, b, c) = (Arc::new(1u8), Arc::new(2u8), Arc::new(3u8));
+        for t in [&a, &b, &c] {
+            let at = **t as usize * 0x1000;
+            assert!(batch.texture_due(t, (at, 0x1000)));
+        }
+        // Inside a, ending where b starts: b and c are as they were.
+        batch.title_wrote(0x1800, 0x800);
+        assert!(batch.texture_due(&a, (0x1000, 0x1000)));
+        assert!(!batch.texture_due(&b, (0x2000, 0x1000)));
+        assert!(!batch.texture_due(&c, (0x3000, 0x1000)));
+        // The last byte of c.
+        batch.title_wrote(0x3fff, 1);
+        assert!(!batch.texture_due(&a, (0x1000, 0x1000)));
+        assert!(!batch.texture_due(&b, (0x2000, 0x1000)));
+        assert!(batch.texture_due(&c, (0x3000, 0x1000)));
+        // Across the line between a and b.
+        batch.title_wrote(0x1fff, 2);
+        assert!(batch.texture_due(&a, (0x1000, 0x1000)));
+        assert!(batch.texture_due(&b, (0x2000, 0x1000)));
+        assert!(!batch.texture_due(&c, (0x3000, 0x1000)));
     }
 
     /// The hashing a submission does for textures in physical-page memory,
@@ -9409,7 +9445,7 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
             let started = std::time::Instant::now();
             for _ in 0..LISTS {
                 for t in &textures {
-                    if !dedupe || batch.texture_due(t) {
+                    if !dedupe || batch.texture_due(t, (t.as_ptr() as usize, SIZE)) {
                         std::hint::black_box(blake3::hash(t));
                         hashed += 1;
                     }
