@@ -1014,6 +1014,27 @@ mod tests {
         stores_v1(&[0x7E04_028B, 0xDACC_0000, 0x0100_0200]).unwrap();
     }
 
+    /// A select or carry-in on a mask the code holds as a number (a
+    /// constant bit pattern, a root constant) that structurisation does not
+    /// follow: the lane reads its own bit of it, by its console lane, and the
+    /// number turns console lanes on. The carry-in stopped with "a carry-in
+    /// from an untracked mask".
+    #[test]
+    fn a_select_or_carry_in_on_a_mask_held_as_a_number_reads_the_lanes_bit() {
+        // s_mov_b32 vcc_lo, 0x55555555; s_mov_b32 vcc_hi, 0x55555555, and
+        // s_mov_b32 vcc_lo, s0; s_mov_b32 vcc_hi, s0; then v_mov_b32 v2, 11
+        let constant = [0xBEEA_03FF, 0x5555_5555, 0xBEEB_03FF, 0x5555_5555, 0x7E04_028B];
+        let root = [0xBEEA_0300, 0xBEEB_0300, 0x7E04_028B];
+        // v_cndmask_b32 v1, 0, v2, vcc / v_add_co_ci_u32 v1, vcc, 0, v2, vcc
+        for number in [&constant[..], &root] {
+            for op in [0x0202_0480, 0x5002_0480] {
+                let mut body = number.to_vec();
+                body.push(op);
+                stores_v1(&body).unwrap_or_else(|e| panic!("{body:x?}: {e}"));
+            }
+        }
+    }
+
     /// A carry-in reading a join of compares after a divergent branch. A
     /// lane that skipped the inner compare has VCC clear there (VOPC clears
     /// inactive lanes), not the first compare's bit, so the join is no
