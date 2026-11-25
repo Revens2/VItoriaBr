@@ -204,13 +204,54 @@ fn sweep() {
     crate::resource::let_go_idle();
 }
 
-/// Drops `object` once every submission running now has finished: at once
-/// if none is.
+/// Background reaper thread that drops finished D3D12 allocations off the
+/// critical `victory-late-wait` and `victory-submit` paths (`DestroyAllocation2`
+/// / `FreeGpuVirtualAddress` otherwise cost 13-18 ms/frame on those threads).
+/// `VICTORY_REAPER=0` drops them on the calling thread instead (as before #1053).
+fn reap(item: Retired) {
+    use std::sync::{Arc, Condvar};
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_REAPER").is_none_or(|v| v != "0")) {
+        drop(item);
+        return;
+    }
+    static QUEUE: OnceLock<Arc<(Mutex<Vec<Retired>>, Condvar)>> = OnceLock::new();
+    let q = QUEUE.get_or_init(|| {
+        let pair = Arc::new((Mutex::new(Vec::<Retired>::new()), Condvar::new()));
+        let bg = Arc::clone(&pair);
+        let _ = std::thread::Builder::new()
+            .name("victory-reaper".into())
+            .spawn(move || {
+                let (lock, wake) = &*bg;
+                loop {
+                    let batch = {
+                        let mut items = lock.lock().unwrap_or_else(|e| e.into_inner());
+                        while items.is_empty() {
+                            items = wake.wait(items).unwrap_or_else(|e| e.into_inner());
+                        }
+                        std::mem::take(&mut *items)
+                    };
+                    drop(batch);
+                }
+            });
+        pair
+    });
+    let (lock, wake) = &**q;
+    lock.lock().unwrap_or_else(|e| e.into_inner()).push(item);
+    wake.notify_one();
+}
+
+/// Drops `object` once every submission running now has finished: offloaded
+/// to the background reaper if none is running (except in unit tests).
 pub(crate) fn retire<T: 'static>(object: T) {
     let started = STARTED.load(Ordering::Acquire);
     if started <= FINISHED.load(Ordering::Acquire) {
         RETIREMENTS[0].fetch_add(1, Ordering::Relaxed);
-        drop(object);
+        if cfg!(test) {
+            drop(object);
+        } else {
+            reap(Retired(Box::new(object)));
+        }
         return;
     }
     RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
@@ -233,7 +274,13 @@ fn bury(finished: u64) {
         *retired = keep;
         done
     };
-    drop(done);
+    if !done.is_empty() {
+        if cfg!(test) {
+            drop(done);
+        } else {
+            reap(Retired(Box::new(done)));
+        }
+    }
 }
 
 /// Objects [`retire`] dropped at once (no submission was running) and
@@ -3557,6 +3604,15 @@ fn late_line(frames: f64) {
             bytes / (1 << 20) as f64
         );
     }
+    if crate::shadow::refresh_compare() {
+        let [read, taken, runs] = crate::shadow::compared_stats().map(|n| n as f64 / frames);
+        tracing::info!(
+            "refreshes that compare per frame (VICTORY_REFRESH_COMPARE=1): {:.1} MB of pages written since their last \
+             copy read, {:.1} MB of them differed from the copy and were taken, in {runs:.0} runs",
+            read / (1 << 20) as f64,
+            taken / (1 << 20) as f64
+        );
+    }
 }
 
 #[cfg(test)]
@@ -6124,7 +6180,16 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         self._alive.used();
-        *self.deferred() = Deferred::default();
+        let old_deferred = std::mem::take(&mut *self.deferred());
+        if !cfg!(test)
+            && (!old_deferred.uploads.is_empty()
+                || !old_deferred.kept.is_empty()
+                || !old_deferred.backs.is_empty())
+        {
+            reap(Retired(Box::new(old_deferred)));
+        } else {
+            drop(old_deferred);
+        }
         self.writes.store(0, Ordering::Relaxed);
         {
             let mut chunks = self.clamp_chunks.lock().unwrap_or_else(|e| e.into_inner());
