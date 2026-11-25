@@ -70,17 +70,18 @@ fn too_dear(shaders: &[Arc<Shader>]) -> bool {
     out && named(shaders, b"CS_ScreenProbes_ActivateRays")
 }
 
-/// Whether a shader only shades what the console's ray-tracing structures
-/// were hit by: about 1,000 compute programs of the title, all bound
-/// at the world's first frame, each 5 to 9 s of AMD's compiler. They stood in
-/// the queue before the passes that make the picture, and with the structure
-/// builder off there is no hit to shade.
-/// `VICTORY_RT_RESOLVE=1` makes them, as does the builder being on.
+/// Whether a shader that only shades what the console's ray-tracing
+/// structures were hit by is left out: about 1,000 compute programs of the
+/// title, all bound at the world's first frame, each 5 to 9 s of AMD's
+/// compiler. They are made by default: left out, about 630 indirect
+/// dispatches a frame were dropped on an NVIDIA card (RTX 5070), with the
+/// structure builder off too. `VICTORY_RT_RESOLVE=0` leaves them out, unless
+/// the builder is on.
 fn without_structures(shaders: &[Arc<Shader>]) -> bool {
-    static MADE: OnceLock<bool> = OnceLock::new();
-    let on = |name| std::env::var_os(name).is_some_and(|v| v == "1");
-    let made = *MADE.get_or_init(|| on("VICTORY_RT_RESOLVE") || on("VICTORY_BVH_BUILDER"));
-    !made && named(shaders, b"CS_RaytracingResolve")
+    static OUT: OnceLock<bool> = OnceLock::new();
+    let is = |name, value| std::env::var_os(name).is_some_and(|v| v == value);
+    let out = *OUT.get_or_init(|| is("VICTORY_RT_RESOLVE", "0") && !is("VICTORY_BVH_BUILDER", "1"));
+    out && named(shaders, b"CS_RaytracingResolve")
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
