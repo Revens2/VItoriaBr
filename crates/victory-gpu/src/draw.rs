@@ -744,7 +744,16 @@ fn look_slots<T: Send + 'static>(slots: &[u32], look: impl Fn(u32) -> T + Sync) 
 /// order: the slot's record (read before its view is made), its view, and
 /// the host copy the view reads.
 fn par_look(heap: &crate::descriptor::Heap, host: &crate::descriptor::host::HostHeap, slots: &[u32]) -> Vec<Looked> {
-    look_slots(slots, |index| {
+    /// The heap and host heap are shared by the title's recording threads
+    /// (`mirror` is made for concurrent callers); the jobs only read them.
+    struct Shared<T>(*const T);
+    // SAFETY: as above; `look_slots` returns before the references end.
+    unsafe impl<T> Sync for Shared<T> {}
+    unsafe impl<T> Send for Shared<T> {}
+    let (heap, host) = (Shared(heap), Shared(host));
+    look_slots(slots, move |index| {
+        // SAFETY: both outlive the call (`look_slots` waits for its jobs).
+        let (heap, host) = unsafe { (&*heap.0, &*host.0) };
         let Some(handle) = heap.handle(index) else {
             return Looked::Skip;
         };
