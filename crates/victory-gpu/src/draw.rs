@@ -689,6 +689,102 @@ fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
     roots[slot] = root;
 }
 
+/// What one slot of the heap's buffer views shows (see [`par_look`]).
+enum Looked {
+    /// Nothing to keep (no handle, no view, no memory).
+    Skip,
+    /// A buffer view whose memory has no host copy yet: record, entry.
+    Orphan([u32; 3], Option<u32>),
+    /// The host copy, address and length the slot reads, record, entry.
+    Keep(std::sync::Arc<crate::shadow::Shadow>, u64, u64, [u32; 3], Option<u32>),
+}
+
+/// `VICTORY_PREP_PAR_HEAP=1` (off by default): [`State::heap_buffers`] looks
+/// at the slots of its pass on the `victory-wide-N` threads, then applies
+/// what they found on its own thread in the order of the slots.
+fn par_heap() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PREP_PAR_HEAP").is_some_and(|v| v == "1"))
+}
+
+/// Passes with fewer slots than this are looked at on the calling thread.
+const PAR_HEAP_FROM: usize = 512;
+
+/// `look` of each of `slots`, in order, the work cut into runs of slots
+/// for the kept threads. Returns when every run is done.
+fn look_slots<T: Send + 'static>(slots: &[u32], look: impl Fn(u32) -> T + Sync) -> Vec<T> {
+    let jobs = crate::shadow::wide_workers() + 1;
+    if slots.len() < 2 * jobs {
+        return slots.iter().map(|&i| look(i)).collect();
+    }
+    let each = slots.len().div_ceil(jobs);
+    let look: &(dyn Fn(u32) -> T + Sync) = &look;
+    // SAFETY: `wide_run` returns only when every job has run; nothing the
+    // jobs hold outlives this call.
+    let look: &'static (dyn Fn(u32) -> T + Sync) = unsafe { std::mem::transmute(look) };
+    let done: std::sync::Arc<std::sync::Mutex<Vec<(usize, Vec<T>)>>> = Default::default();
+    let work: Vec<Box<dyn FnOnce() + Send>> = slots
+        .chunks(each)
+        .enumerate()
+        .map(|(n, run)| {
+            let (run, done) = (run.to_vec(), done.clone());
+            Box::new(move || {
+                let found: Vec<T> = run.iter().map(|&i| look(i)).collect();
+                done.lock().unwrap_or_else(|e| e.into_inner()).push((n, found));
+            }) as Box<dyn FnOnce() + Send>
+        })
+        .collect();
+    crate::shadow::wide_run(work);
+    let mut done = std::mem::take(&mut *done.lock().unwrap_or_else(|e| e.into_inner()));
+    done.sort_unstable_by_key(|d| d.0);
+    done.into_iter().flat_map(|d| d.1).collect()
+}
+
+/// What each of `slots` of `heap` shows, for the pass that applies it in
+/// order: the slot's record (read before its view is made), its view, and
+/// the host copy the view reads.
+fn par_look(heap: &crate::descriptor::Heap, host: &crate::descriptor::host::HostHeap, slots: &[u32]) -> Vec<Looked> {
+    look_slots(slots, |index| {
+        let Some(handle) = heap.handle(index) else {
+            return Looked::Skip;
+        };
+        let record = crate::descriptor::record_at(handle);
+        let entry = crate::descriptor::record_entry(record);
+        let Some(view) = host.mirror(index, handle, true) else {
+            return Looked::Skip;
+        };
+        match crate::descriptor::host::buffer_copy(&view) {
+            Some((shadow, address, len)) => Looked::Keep(shadow, address, len, record, entry),
+            None if crate::descriptor::host::buffer_range(&view).is_some_and(|(_, len)| len > 0) => Looked::Orphan(record, entry),
+            None => Looked::Skip,
+        }
+    })
+}
+
+#[cfg(test)]
+mod par_heap_tests {
+    use super::look_slots;
+
+    /// Same results in the same order as the plain loop, on random slots.
+    #[test]
+    fn look_slots_equals_sequential_on_random_slots() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..200 {
+            let n = (next() % 3000) as usize;
+            let slots: Vec<u32> = (0..n).map(|_| (next() % 90_000) as u32).collect();
+            let look = |i: u32| (i, i.wrapping_mul(2_654_435_761) >> 7, vec![i as u8; (i % 5) as usize]);
+            let want: Vec<_> = slots.iter().map(|&i| look(i)).collect();
+            assert!(look_slots(&slots, look) == want);
+        }
+    }
+}
+
 impl State {
     pub(crate) fn reset(&mut self, pipeline: This) {
         *self = State::default();
@@ -1657,7 +1753,34 @@ impl State {
         static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         let mut alive = !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
         HEAP_PASS_PARTS[1].fetch_add(slots.len() as u64, Ordering::Relaxed);
-        for (n, &index) in slots.iter().enumerate() {
+        // `VICTORY_PREP_PAR_HEAP=1`: the slots are looked at on the wide
+        // threads (what each slot shows), then applied here in order.
+        let par = (par_heap() && slots.len() >= PAR_HEAP_FROM).then(|| par_look(heap, host, &slots));
+        let par_on = par.is_some();
+        if let Some(looked) = par {
+            if alive && let Some(why) = crate::descriptor::host::device_removed() {
+                GONE.store(true, Ordering::Relaxed);
+                tracing::error!(why, "the host device went while buffer views of the heap were made (VICTORY_PREP_PAR_HEAP)");
+                crate::host::log_removal_context();
+            }
+            for (&index, look) in slots.iter().zip(looked) {
+                ranges.forget(index);
+                match look {
+                    Looked::Skip => {}
+                    Looked::Orphan(record, entry) => ranges.orphan(index, record, entry),
+                    Looked::Keep(shadow, address, len, record, entry) => {
+                        #[cfg(feature = "diagnostics")]
+                        if host.shows(index, &shadow.buffer) == Some(false) {
+                            HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
+                        }
+                        let key = std::sync::Arc::as_ptr(&shadow) as usize;
+                        ranges.keep(index, key, &shadow, address, address + len, record, entry);
+                    }
+                }
+            }
+        }
+        let plain: &[u32] = if par_on { &[] } else { &slots };
+        for (n, &index) in plain.iter().enumerate() {
             ranges.forget(index);
             let Some(handle) = heap.handle(index) else {
                 continue;
