@@ -27,6 +27,9 @@ pub(crate) const FULL_EVERY: u64 = 256;
 /// two looks at every slot with the old pass).
 pub(crate) const ORPHANS_EVERY: u64 = 16;
 
+/// Freed table entries a heap's pass keeps at most ([`Picked::note_forgotten`]).
+pub(crate) const FORGOTTEN_MOST: usize = 1 << 16;
+
 /// Whether `VICTORY_HEAP_PASS_FULL=1` asks for the old pass.
 pub(crate) fn full_pass() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -85,11 +88,29 @@ impl<C: Clone> Picked<C> {
     /// View table entries were freed (`None`: some were, which is not
     /// known): their slots are looked at next pass. Every heap's pass is
     /// told, though one of them asks.
+    ///
+    /// Only entries some slot's record named at its last look are kept (the
+    /// others change nothing), and at most [`FORGOTTEN_MOST`] of them: a
+    /// heap whose pass does not run (the title draws with another) is told
+    /// at every pass of the one that does, and kept every entry before
+    /// (2,097,152 in a review's run). Past that the list is dropped, and
+    /// that heap's next pass looks at all its slots.
     pub(crate) fn note_forgotten(&mut self, entries: Option<&[u32]>) {
         match (entries, &mut self.forgotten) {
-            (Some(new), Some(kept)) => kept.extend_from_slice(new),
+            (Some(new), Some(kept)) => {
+                kept.extend(new.iter().copied().filter(|e| self.by_entry.contains_key(e)));
+                if kept.len() > FORGOTTEN_MOST {
+                    self.forgotten = None;
+                }
+            }
             _ => self.forgotten = None,
         }
+    }
+
+    /// The entries kept for the next pass (tests).
+    #[cfg(test)]
+    fn forgotten_len(&self) -> Option<usize> {
+        self.forgotten.as_ref().map(Vec::len)
     }
 
     /// The slots this pass looks at again, in order. `changed`: the slots
@@ -303,6 +324,28 @@ mod tests {
         Heap {
             records: (0..n).map(|s| (s, [1, 100 + s, 1])).collect(),
         }
+    }
+
+    /// A heap whose pass does not run is told of the freed entries at
+    /// every pass of the heap that does: it keeps only those its slots
+    /// name, at most [`FORGOTTEN_MOST`], and past that its next pass looks
+    /// at every slot (a review found 2,097,152 entries kept before).
+    #[test]
+    fn a_dormant_heap_keeps_few_forgotten_entries_and_falls_back_to_all() {
+        let heap = heap(64);
+        let mut p = Picked::new(false);
+        assert_eq!(pass(&mut p, &heap, vec![], vec![]).len(), 64);
+        let unnamed: Vec<u32> = (1_000_000..1_000_000 + 2_097_152).collect();
+        p.note_forgotten(Some(&unnamed));
+        assert_eq!(p.forgotten_len(), Some(0), "entries no slot names are not kept");
+        p.note_forgotten(Some(&[117]));
+        assert_eq!(p.forgotten_len(), Some(1));
+        assert_eq!(pass(&mut p, &heap, vec![], vec![]), vec![17]);
+        for _ in 0..=FORGOTTEN_MOST {
+            p.note_forgotten(Some(&[117]));
+        }
+        assert_eq!(p.forgotten_len(), None, "dropped past the bound");
+        assert_eq!(pass(&mut p, &heap, vec![], vec![]).len(), 64, "and every slot looked at");
     }
 
     #[test]
