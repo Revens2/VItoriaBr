@@ -84,23 +84,6 @@ impl Host {
                     CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
                 let adapter: IDXGIAdapter = factory.EnumWarpAdapter().map_err(err)?;
                 D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
-            } else if let Some(name) = std::env::var("VICTORY_TEST_ADAPTER").ok().filter(|n| !n.is_empty()) {
-                // `VICTORY_TEST_ADAPTER=<part of its name>`: that adapter, not the default (a
-                // laptop's default is its integrated GPU, with waves of 16 at most).
-                let factory: IDXGIFactory4 =
-                    CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
-                let mut found = None;
-                for i in 0.. {
-                    let Ok(adapter) = factory.EnumAdapters1(i) else { break };
-                    let Ok(desc) = adapter.GetDesc1() else { continue };
-                    let len = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
-                    if String::from_utf16_lossy(&desc.Description[..len]).contains(name.as_str()) {
-                        found = Some(adapter);
-                        break;
-                    }
-                }
-                let adapter = found.ok_or_else(|| format!("no adapter named like {name:?}"))?;
-                D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
             } else {
                 D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
                 // A machine without a graphics card gives the software

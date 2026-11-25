@@ -267,14 +267,6 @@ struct Lower<'a> {
     clane: Option<V>,
     /// The first exchange dword of this thread's console wave ([`Self::exchange_pair`]).
     pair: Option<V>,
-    /// With `exchange`: each console wave has two banks of [`BANK`] dwords (else one pair of
-    /// dwords), so a round can give two values and the next round in the same block can use the
-    /// other bank without the group meeting again after the first round's reads
-    /// ([`Self::exchange_round`]).
-    exchange_banks: bool,
-    /// The last exchange round whose closing meeting may still be left out: the block it
-    /// stands in, that meeting (a barrier call) and the bank the round used.
-    exchange_open: Option<(usize, V, u32)>,
     /// A console wave64 program in host waves of 32: the LDS dword counting the console threads
     /// handed to host waves (`wave_base`), and the base made in the entry block.
     halves: Option<u32>,
@@ -351,7 +343,7 @@ pub(super) const MASK_ELSEWHERE: Why = "a lane mask holding lanes elsewhere read
 
 /// Instructions that read a lane mask (not EXEC implicitly, not a lane's
 /// bit) as a number.
-/// Per IR block: every lane of the wave that started the program runs it â€“ no per-lane branch
+/// Per IR block: every lane of the wave that started the program runs it – no per-lane branch
 /// separates it from the entry (it lies in no lane branch's region: the blocks reachable from
 /// the branch that do not post-dominate it). None with an indirect exit (not followed).
 fn all_lane_blocks(st: &Structured) -> Option<Vec<bool>> {
@@ -838,12 +830,6 @@ fn meeting_mode() -> u32 {
     if super::group_sync() == 0 { 8 } else { 1 | 8 }
 }
 
-/// Dwords of one exchange bank of a console wave: a round gives up to two values, a dword
-/// per half for each ([`Lower::exchange_round`]).
-const BANK: u32 = 4;
-/// The host's thread-group shared memory, in dwords (D3D12: 32 KiB).
-const MAX_LDS_DWORDS: u32 = 8192;
-
 /// LDS accesses of a console wave run as two host waves, where some sit in blocks that only
 /// some lanes run (`all` is [`all_lane_blocks`]): per IR block, whether the host waves meet (a
 /// group barrier) at its start and before its exit. `None` if barriers cannot keep the
@@ -954,7 +940,7 @@ fn lane_constant_masks(st: &Structured) -> bool {
     false
 }
 
-/// The widest wave the host GPU runs (0: not known â€“ no host-specific forms); see
+/// The widest wave the host GPU runs (0: not known – no host-specific forms); see
 /// [`set_host_max_wave`].
 static HOST_MAX_WAVE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
@@ -1311,7 +1297,6 @@ impl<'a> Lower<'a> {
         let mut lds_meet: Option<(Vec<bool>, Vec<(bool, bool)>)> = None;
         // a console wave64 program in two host waves of 32 (`exchange`)
         let mut exchange: Option<(u32, bool, Vec<bool>)> = None;
-        let mut exchange_banks = false;
         // a console wave64 program in host waves of 32: the LDS dword of `wave_base`'s counter
         let mut halves: Option<u32> = None;
         let mut lds_dwords = 0;
@@ -1338,8 +1323,8 @@ impl<'a> Lower<'a> {
             let group = cs.threads.iter().product::<u32>();
             let one_wave = group <= wave;
             // A host whose waves are at most 32 lanes (NVIDIA) refuses `WaveSize(64)`. A console
-            // wave64 program whose cross-lane code stays inside 32-lane halves â€“ DPP rows,
-            // `ds_swizzle`, `v_permlane16` / `v_permlanex16`, which the ISA confines there â€“ runs
+            // wave64 program whose cross-lane code stays inside 32-lane halves – DPP rows,
+            // `ds_swizzle`, `v_permlane16` / `v_permlanex16`, which the ISA confines there – runs
             // exactly in waves of 32: the thread relabelling makes each host wave one half of a
             // console wave (lanes 32k..32k+31). Not when it crosses halves (`v_mbcnt`,
             // `v_readlane`, `v_writelane`, `ds_(b)permute`, masks as numbers or lane-constant
@@ -1363,7 +1348,7 @@ impl<'a> Lower<'a> {
                     // waves, which exchange through their own pair of dwords.)
                     // LDS the console shares within its one wave without barriers: split into
                     // two waves of 32, a group barrier before every LDS access keeps their order
-                    // â€“ where every thread of the group gets there (no lane branch around it,
+                    // – where every thread of the group gets there (no lane branch around it,
                     // no guard), else a barrier would hang the group
                     let lds = |i: &Inst| {
                         matches!(i.fields, Fields::Ds { .. })
@@ -1396,11 +1381,7 @@ impl<'a> Lower<'a> {
                                 // lanes 32..63 are the other host wave: masks, lane reads and lane
                                 // numbers go through two exchange dwords past the program's LDS
                                 exchange = Some((s.lds_dwords, group <= 32, all));
-                                // two banks per console wave where the host's shared
-                                // memory has room for them (and `wave_base`'s dword)
-                                let waves = group.div_ceil(64);
-                                exchange_banks = s.lds_dwords + 2 * BANK * waves < MAX_LDS_DWORDS;
-                                s.lds_dwords += if exchange_banks { 2 * BANK } else { 2 } * waves;
+                                s.lds_dwords += 2 * group.div_ceil(64);
                             }
                         }
                     }
@@ -1608,8 +1589,6 @@ impl<'a> Lower<'a> {
                 _ => Default::default(),
             },
             exchange,
-            exchange_banks,
-            exchange_open: None,
             clane: None,
             pair: None,
             halves,
@@ -3595,7 +3574,7 @@ impl<'a> Lower<'a> {
     /// +0 on the hardware, where the host's function of the rounded angle
     /// gives about 1e-7. Infinities and NaN give NaN.
     /// shortcut: below 2^-12 turns the hardware scales by a slightly
-    /// different constant than 2Ï€ (a last-place difference).
+    /// different constant than 2π (a last-place difference).
     fn trig_turns(&mut self, x: V, cosine: bool) -> V {
         let c = self.cur;
         let zero = self.s.m.f32(0);
@@ -3613,7 +3592,7 @@ impl<'a> Lower<'a> {
         self.s.m.select(c, exact, zero, r)
     }
 
-    /// The high dword of a 32 Ã— 32-bit product.
+    /// The high dword of a 32 × 32-bit product.
     fn mul_hi(&mut self, a: V, b: V, signed: bool) -> V {
         let c = self.cur;
         let i64t = self.s.m.int(64);
@@ -3627,7 +3606,7 @@ impl<'a> Lower<'a> {
         self.s.m.cast(c, Cast::Trunc, hi, self.s.t.i32)
     }
 
-    /// `0 Ã— anything = 0`, as in D3D9.
+    /// `0 × anything = 0`, as in D3D9.
     fn legacy_mul(&mut self, a: V, b: V) -> V {
         let c = self.cur;
         let m = self.s.m.bin(c, Bin::Mul, a, b);
@@ -3799,109 +3778,55 @@ impl<'a> Lower<'a> {
     }
 
     /// A group barrier with an LDS fence in `block`.
-    fn group_sync(&mut self, block: usize) -> V {
+    fn group_sync(&mut self, block: usize) {
         let mode = self.s.m.i32(meeting_mode());
         let void = self.s.t.void;
-        self.s.op(block, "barrier", Attr::NoDuplicate, void, 80, &[mode])
+        self.s.op(block, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
     }
 
     /// `exchange`: each host wave gives `mine` (the same in all its lanes) for its half; both get
     /// (lower half's, upper half's). A group with no upper half gets 0 for it.
     fn exchange_halves(&mut self, at: usize, mine: V) -> (V, V) {
-        self.exchange_round(at, &[mine])[0]
-    }
-
-    /// [`Self::exchange_halves`] of each of `mine` (one or two values): with banks, in one
-    /// round (the group meets twice), else a round each.
-    ///
-    /// A round stores this half's dword of each value in its bank, meets, reads both halves'
-    /// and meets again, so that no thread writes the bank before every thread has read it.
-    /// With banks, a round in the block of the round before takes the other bank and leaves
-    /// out that round's second meeting: in one block every thread reads the earlier round's
-    /// bank before it stores into the other one and goes to this round's first meeting, and
-    /// the bank after that is written only after that meeting, which no thread reaches before
-    /// it has read. Only exchange rounds use the banks (and `v_readlane`'s, which closes its
-    /// own round).
-    fn exchange_round(&mut self, at: usize, mine: &[V]) -> Vec<(V, V)> {
         let Some((slot, small, _)) = self.exchange.as_ref().map(|(a, b, _)| (*a, *b, ())) else {
             let z = self.s.m.i32(0);
-            return mine.iter().map(|&m| (m, z)).collect();
+            return (mine, z);
         };
         if small {
             let z = self.s.m.i32(0);
-            return mine.iter().map(|&m| (m, z)).collect();
+            return (mine, z);
         }
         if self.local {
             // each host wave on its own: its half holds `mine`, the other nothing
             let cl = self.console_lane();
             let (k32, z) = (self.s.m.i32(32), self.s.m.i32(0));
             let upper = self.s.m.cmp(at, pred::IUGE, cl, k32);
-            return mine
-                .iter()
-                .map(|&m| {
-                    let lo = self.s.m.select(at, upper, z, m);
-                    let hi = self.s.m.select(at, upper, m, z);
-                    (lo, hi)
-                })
-                .collect();
+            let lo = self.s.m.select(at, upper, z, mine);
+            let hi = self.s.m.select(at, upper, mine, z);
+            return (lo, hi);
         }
-        if !self.exchange_banks || mine.len() > (BANK / 2) as usize {
-            return mine
-                .iter()
-                .flat_map(|&m| self.exchange_bank(at, slot, &[m]))
-                .collect();
-        }
-        self.exchange_bank(at, slot, mine)
-    }
-
-    /// One round of [`Self::exchange_round`]: `mine` fits a bank (one value without banks).
-    fn exchange_bank(&mut self, at: usize, slot: u32, mine: &[V]) -> Vec<(V, V)> {
-        // the bank: the other one than the open round's in this block, whose closing meeting
-        // then goes
-        let bank = match self.exchange_open.take() {
-            Some((b, meeting, used)) if self.exchange_banks && b == at => {
-                let gone = self.s.m.remove(at, meeting);
-                debug_assert!(gone, "the open round's meeting is in its block");
-                1 - used
-            }
-            _ => 0,
-        };
-        // the dwords of this thread's console wave: per value its half's, then both
+        // the pair of dwords of this thread's console wave: its half's, then both
         let pair = self.exchange_pair(slot);
         let cl = self.console_lane();
         let five = self.s.m.i32(5);
         let half = self.s.m.bin(at, Bin::LShr, cl, five);
+        let index = self.s.m.bin(at, Bin::Add, pair, half);
         let lds = self.s.lds();
-        let first = |l: &mut Self, k: u32| {
-            let off = l.s.m.i32(bank * BANK + 2 * k);
-            l.s.m.bin(at, Bin::Add, pair, off)
-        };
-        for (k, &m) in mine.iter().enumerate() {
-            let base = first(self, k as u32);
-            let index = self.s.m.bin(at, Bin::Add, base, half);
-            let ptr = self.s.m.element(at, lds, index);
-            self.s.m.store(at, ptr, m);
-        }
+        let ptr = self.s.m.element(at, lds, index);
+        self.s.m.store(at, ptr, mine);
         self.group_sync(at);
-        let mut got = Vec::with_capacity(mine.len());
-        for k in 0..mine.len() {
-            let base = first(self, k as u32);
-            let one = self.s.m.i32(1);
-            let next = self.s.m.bin(at, Bin::Add, base, one);
-            let p0 = self.s.m.element(at, lds, base);
-            let p1 = self.s.m.element(at, lds, next);
-            let lo = self.s.m.load(at, p0);
-            let hi = self.s.m.load(at, p1);
-            got.push((lo, hi));
-        }
-        // the bank is written again only after every thread read it
-        let meeting = self.group_sync(at);
-        self.exchange_open = Some((at, meeting, bank));
-        got
+        let one = self.s.m.i32(1);
+        let k1 = self.s.m.bin(at, Bin::Add, pair, one);
+        let p0 = self.s.m.element(at, lds, pair);
+        let p1 = self.s.m.element(at, lds, k1);
+        let lo = self.s.m.load(at, p0);
+        let hi = self.s.m.load(at, p1);
+        // the slots are written again only after every thread read them
+        self.group_sync(at);
+        (lo, hi)
     }
 
-    /// The first exchange dword of this thread's console wave (made in the entry block): a
-    /// group of several console waves has its dwords for each (two, or two banks).
+    /// The first of the two exchange dwords of this thread's console wave (made in the entry
+    /// block): a group of several console waves has a pair for each.
     fn exchange_pair(&mut self, slot: u32) -> V {
         if let Some(v) = self.pair {
             return v;
@@ -3910,11 +3835,10 @@ impl<'a> Lower<'a> {
         let thread = self.console_thread();
         let six = self.s.m.i32(6);
         let wave = self.s.m.bin(e, Bin::LShr, thread, six);
-        // (2 * BANK dwords: shifted by 3)
-        let per = self.s.m.i32(if self.exchange_banks { 3 } else { 1 });
-        let at = self.s.m.bin(e, Bin::Shl, wave, per);
+        let one = self.s.m.i32(1);
+        let twice = self.s.m.bin(e, Bin::Shl, wave, one);
         let base = self.s.m.i32(slot);
-        let v = self.s.m.bin(e, Bin::Add, base, at);
+        let v = self.s.m.bin(e, Bin::Add, base, twice);
         self.pair = Some(v);
         v
     }
@@ -4724,7 +4648,7 @@ impl<'a> Lower<'a> {
             _ => 1,
         };
         // (byte offset, dwords) per element; read2/write2 scale their two
-        // offsets by the element size (Ã—64 for st64).
+        // offsets by the element size (×64 for st64).
         let pair = |n: &str| -> Vec<(u32, u32)> {
             let w = width(n);
             let scale = 4 * w * if n.contains("st64") { 64 } else { 1 };
@@ -4944,7 +4868,7 @@ impl<'a> Lower<'a> {
     /// otherwise a NaN loses to a number (two quiet NaNs give the data);
     /// numbers compare as floats with -0 below +0.
     // shortcut: f32 denormals compare as kept; with the console's MODE
-    // flushing them they would order as Â±0 first (MODE is not modelled).
+    // flushing them they would order as ±0 first (MODE is not modelled).
     fn lds_float_min_max(&mut self, p: V, data: V, max: bool) -> V {
         let pre = self.cur;
         let init = self.s.m.load(pre, p);
@@ -5054,10 +4978,6 @@ impl<'a> Lower<'a> {
             && matches!(inst.fields, Fields::Ds { .. })
             && !(name.starts_with("ds_swizzle") || name.contains("permute"))
             && self.lds_meet.as_ref().is_none_or(|(all, _)| all[b])
-            // A read after the group met in this block with nothing but reads since needs
-            // no meeting of its own: no thread can write between (that write would have
-            // its meeting first), and reads do not disturb each other.
-            && !(name.starts_with("ds_read") && self.s.m.met_and_only_read(self.cur, 512))
         {
             // the two host waves of a console wave meet before each LDS access: what the other
             // half wrote is visible, and what it still reads is not overwritten
@@ -7845,8 +7765,6 @@ impl<'a> Lower<'a> {
                     }
                     let cl = self.console_lane();
                     let is = self.s.m.cmp(self.cur, pred::EQ, cl, lane);
-                    // (the first dword of bank 0: an open round keeps its closing meeting)
-                    self.exchange_open = None;
                     let k = self.exchange_pair(slot);
                     let at = self.begin_guarded(Some(is));
                     let lds = self.s.lds();
@@ -7857,8 +7775,7 @@ impl<'a> Lower<'a> {
                     self.group_sync(c2);
                     let ptr = self.s.m.element(c2, lds, k);
                     let r = self.s.m.load(c2, ptr);
-                    let meeting = self.group_sync(c2);
-                    self.exchange_open = Some((c2, meeting, 0));
+                    self.group_sync(c2);
                     return int(self, r);
                 }
                 let r = self.read_lane(a, lane);
@@ -7939,8 +7856,8 @@ impl<'a> Lower<'a> {
                     } else {
                         let i32t = self.s.t.i32;
                         let has = self.s.m.cast(c, Cast::ZExt, any, i32t);
-                        let got = self.exchange_round(c, &[has, mine]);
-                        let ((lo_has, hi_has), (lo, hi)) = (got[0], got[1]);
+                        let (lo_has, hi_has) = self.exchange_halves(c, has);
+                        let (lo, hi) = self.exchange_halves(c, mine);
                         let z = self.s.m.i32(0);
                         let in_lo = self.s.m.cmp(c, pred::NE, lo_has, z);
                         let in_hi = self.s.m.cmp(c, pred::NE, hi_has, z);
@@ -10468,7 +10385,7 @@ impl<'a> Lower<'a> {
     /// `|v_cubema|`, plus 1.5) and the face id (`v_cubeid`), which the
     /// host's cube sampling turns back into the same texel.
     // shortcut: the view is taken as a cube, not a cube array (whose face
-    // operand adds 8 Ã— the slice).
+    // operand adds 8 × the slice).
     fn cube_direction(&mut self, s: V, t: V, face: V) -> [V; 3] {
         let c = self.cur;
         let k = |l: &mut Self, v: f32| l.s.m.f32(v.to_bits());

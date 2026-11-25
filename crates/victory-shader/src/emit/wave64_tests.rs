@@ -424,12 +424,9 @@ fn on_the_card(shader: &HostShader, constants: [u32; 2]) -> Option<u32> {
         eprintln!("no SM 6.6 hardware device; not run");
         return None;
     };
-    let (root, pso) = match host.compute_pipeline(shader) {
-        Ok(x) => x,
-        Err(e) => {
-            eprintln!("the hardware device does not take this program: {e}; not run");
-            return None;
-        }
+    let Ok((root, pso)) = host.compute_pipeline(shader) else {
+        eprintln!("the hardware device does not take this program; not run");
+        return None;
     };
     let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
     for u in &shader.user_data {
@@ -557,47 +554,4 @@ fn a_first_lane_refusal_is_retried_wave_wide() {
         crate::native::HwStage::Cs,
         "a descriptor chosen by control flow"
     ));
-}
-
-/// 64 threads in one console wave, in two host waves that exchange: a lane read (`v_readlane`
-/// of lane s0) and two first-lane reads under EXEC (the lanes from s1 up) in one block, so
-/// that each exchange round after the first takes the other bank and the round before it
-/// does not meet again, and the first-lane read gives "has a lane" and its value in one
-/// round. Every thread stores (lane s0's v0 + 100) + (first lane's v0 + 100) + 2 Ã— first
-/// lane's v0; with no lane in EXEC the console's first lane is lane 0.
-#[test]
-fn exchange_rounds_in_one_block_share_meetings_and_keep_the_values() {
-    let words = [
-        0x4A02_00FF,
-        100,         // v_add_nc_u32 v1, 100, v0
-        0x3404_0081, // v_lshlrev_b32 v2, 1, v0
-        0xD760_0014,
-        0x0000_0101, // v_readlane_b32 s20, v1, s0
-        0x7D86_0001, // v_cmp_le_u32 vcc, s1, v0
-        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
-        0x7E2A_0501, // v_readfirstlane_b32 s21, v1
-        0x7E2C_0502, // v_readfirstlane_b32 s22, v2
-        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
-        0x7E06_0214, // v_mov_b32 v3, s20
-        0x4A06_0615, // v_add_nc_u32 v3, s21, v3
-        0x4A06_0616, // v_add_nc_u32 v3, s22, v3
-        0x38 << 26 | 0x1C << 18,
-        0x80 << 24 | 2 << 16 | 3 << 8, // buffer_store_dword v3, off, s[8:11], 0
-    ];
-    let native = native(&words);
-    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-    assert_eq!(p.blocks.iter().flat_map(|b| &b.insts).filter(|i| i.name() == "v_readfirstlane_b32").count(), 2);
-    let shader = lowered(&native, &p, &HashSet::new()).expect("lower");
-    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
-        let mut copy = shader.dxil.clone();
-        v.validate(&mut copy).expect("DXIL validation failed");
-    }
-    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
-    for (lane, from) in [(0u32, 0u32), (5, 0), (40, 3), (63, 31), (17, 32), (33, 50), (2, 63), (9, 64), (60, 100)] {
-        let first = if from < 64 { from } else { 0 };
-        let expected = (lane + 100) + (first + 100) + 2 * first;
-        let Some(got) = on_the_card(&shader, [lane, from]) else { return };
-        assert_eq!(got, expected, "lane {lane}, EXEC from lane {from}");
-    }
-    eprintln!("ran on the hardware device: the lane read and both first-lane reads");
 }

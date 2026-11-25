@@ -496,41 +496,6 @@ impl Module {
         let V::Inst(i) = phi else { panic!() };
         self.insts[i as usize].op = Op::Phi(incoming);
     }
-    /// Takes instruction `v` out of `block`'s body; whether it was there.
-    pub fn remove(&mut self, block: usize, v: V) -> bool {
-        let V::Inst(i) = v else { return false };
-        let body = &mut self.blocks[block].body;
-        let before = body.len();
-        body.retain(|&x| x != i);
-        body.len() != before
-    }
-
-    /// Whether, walking back from the end of `block`, a group barrier that waits for the
-    /// group and fences shared memory (mode bits 1 and 8) comes before any store, atomic or
-    /// other call with an effect: since the group last met, the block has only read memory.
-    /// (At most `limit` instructions are looked at; past them, no.)
-    pub fn met_and_only_read(&self, block: usize, limit: usize) -> bool {
-        for &i in self.blocks[block].body.iter().rev().take(limit) {
-            match &self.insts[i as usize].op {
-                Op::Store(..) | Op::AtomicRmw(..) | Op::CmpXchg(..) => return false,
-                Op::Call(f, args) => {
-                    let func = &self.funcs[*f as usize];
-                    if func.name == "dx.op.barrier" {
-                        return args
-                            .get(1)
-                            .and_then(|&m| self.int_value(m))
-                            .is_some_and(|m| m & 9 == 9);
-                    }
-                    if opt::effect(func) == opt::Effect::Writes {
-                        return false;
-                    }
-                }
-                _ => {}
-            }
-        }
-        false
-    }
-
     pub fn terminate(&mut self, block: usize, t: Term) {
         self.blocks[block].term = Some(t);
     }

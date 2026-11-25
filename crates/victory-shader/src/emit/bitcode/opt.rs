@@ -1160,43 +1160,6 @@ mod tests {
         m.blocks[b].body.len()
     }
 
-    /// `Module::met_and_only_read`: a meeting (barrier mode 1 | 8) with only reads after it
-    /// in the block, and not when a store, a call with an effect, a fence-only barrier or the
-    /// start of the block comes first; `Module::remove` takes an instruction out.
-    #[test]
-    fn a_meeting_followed_by_reads_only_is_seen() {
-        let mut k = kit();
-        let (i32t, void) = (k.m.int(32), k.m.void());
-        let bty = k.m.func_ty(void, vec![i32t, i32t]);
-        k.m.ptr(bty);
-        let barrier = k.m.function("dx.op.barrier", bty, Some(Attr::NoDuplicate), false);
-        let arr = k.m.array(4, i32t);
-        let lds = k.m.global("lds", arr, 3);
-        let (code, meet, fence, zero) = (k.m.i32(80), k.m.i32(9), k.m.i32(8), k.m.i32(0));
-        let b = k.b;
-        assert!(!k.m.met_and_only_read(b, 512), "an empty block");
-        k.m.call(b, barrier, vec![code, meet]);
-        assert!(k.m.met_and_only_read(b, 512));
-        let p = k.m.element(b, lds, zero);
-        let x = k.m.load(b, p);
-        k.m.call(b, k.reads, vec![x, x]);
-        k.m.call(b, k.pure, vec![x, x]);
-        assert!(k.m.met_and_only_read(b, 512), "reads and pure calls");
-        assert!(!k.m.met_and_only_read(b, 2), "past the limit");
-        let w = k.m.call(b, k.writes, vec![x, x]);
-        assert!(!k.m.met_and_only_read(b, 512), "a call with an effect");
-        assert!(k.m.remove(b, w));
-        assert!(!k.m.remove(b, w), "only once");
-        assert!(k.m.met_and_only_read(b, 512));
-        k.m.store(b, p, x);
-        assert!(!k.m.met_and_only_read(b, 512), "a store");
-        let f = k.m.call(b, barrier, vec![code, fence]);
-        assert!(!k.m.met_and_only_read(b, 512), "a fence that does not wait");
-        k.m.remove(b, f);
-        k.m.call(b, barrier, vec![code, meet]);
-        assert!(k.m.met_and_only_read(b, 512), "met again after the store");
-    }
-
     #[test]
     fn unread_results_without_effect_are_dropped() {
         let Kit {
