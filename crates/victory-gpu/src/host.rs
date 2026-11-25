@@ -2050,8 +2050,8 @@ pub(crate) fn late() -> bool {
     late_stage() > 0
 }
 
-/// `VICTORY_SYNC_PRECISE=1` (off by default): a submission sent ahead
-/// waits only for what it depends on.
+/// On unless `VICTORY_SYNC_PRECISE=0`: a submission sent ahead waits only
+/// for what it depends on.
 ///
 /// - A texture's staging buffer is not a reason to wait before preparing:
 ///   its write waits, on the card's fence, for the last submission that
@@ -2068,9 +2068,9 @@ pub(crate) fn late() -> bool {
 pub(crate) fn sync_precise() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        let on = std::env::var_os("VICTORY_SYNC_PRECISE").is_some_and(|v| v == "1");
+        let on = std::env::var_os("VICTORY_SYNC_PRECISE").is_none_or(|v| v != "0");
         if on {
-            tracing::info!("submissions wait only for the submissions they depend on (VICTORY_SYNC_PRECISE=1)");
+            tracing::info!("submissions wait only for the submissions they depend on (VICTORY_SYNC_PRECISE=0 turns this off)");
         }
         on
     })
