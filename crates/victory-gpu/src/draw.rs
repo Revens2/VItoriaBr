@@ -750,10 +750,16 @@ fn par_look(heap: &crate::descriptor::Heap, host: &crate::descriptor::host::Host
     // SAFETY: as above; `look_slots` returns before the references end.
     unsafe impl<T> Sync for Shared<T> {}
     unsafe impl<T> Send for Shared<T> {}
+    impl<T> Shared<T> {
+        /// (A method, so that a closure takes the whole wrapper.)
+        fn get(&self) -> *const T {
+            self.0
+        }
+    }
     let (heap, host) = (Shared(heap), Shared(host));
     look_slots(slots, move |index| {
         // SAFETY: both outlive the call (`look_slots` waits for its jobs).
-        let (heap, host) = unsafe { (&*heap.0, &*host.0) };
+        let (heap, host) = unsafe { (&*heap.get(), &*host.get()) };
         let Some(handle) = heap.handle(index) else {
             return Looked::Skip;
         };
