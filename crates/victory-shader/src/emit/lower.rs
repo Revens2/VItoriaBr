@@ -8107,6 +8107,9 @@ impl<'a> Lower<'a> {
                     return Err("a 64-bit result");
                 };
                 self.s.flags |= flags::DOUBLES;
+                if name == "v_fma_f64" {
+                    self.s.flags |= flags::DOUBLE_EXT;
+                }
                 let f64t = self.s.m.double();
                 let i32t = self.s.t.i32;
                 let sources = if name == "v_fma_f64" { 3 } else { 2 };

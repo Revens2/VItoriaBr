@@ -1396,6 +1396,11 @@ fn v_ldexp_f32_and_f16_scale_by_powers_of_two() {
     let inputs: Vec<[u32; 4]> = cases.iter().map(|c| [c.0, c.1, 0, 0]).collect();
     run_cases(&shader, &inputs, |backend, i, _, got| {
         let want = cases[i].2;
+        // WARP's f32 -> f16 conversion truncates: an overflow gives the largest
+        // finite half (0x7BFF) where hardware gives infinity (0x7C00).
+        if backend == "warp" && want == 0x7C00 && got == 0x7BFF {
+            return;
+        }
         assert_eq!(got, want, "{backend}: v_ldexp_f16 case {i} got {got:#010x}, want {want:#010x}");
     });
 }
