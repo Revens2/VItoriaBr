@@ -5055,7 +5055,7 @@ impl Host {
                             CARD_PASSES[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
                             CARD_PASSES[1].fetch_add(runs.iter().map(|r| u64::from(r.pieces)).sum::<u64>(), Ordering::Relaxed);
                             for run in runs {
-                                let constants = [run.first, run.skew, w.shadow.card_hashed().unwrap_or(w.size) as u32, run.pieces, 0, 0];
+                                let constants = [run.first, run.skew, w.size as u32, run.pieces, 0, 0];
                                 list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
                                 list.Dispatch(card_compare_groups(run.pieces), 1, 1);
                             }
