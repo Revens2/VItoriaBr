@@ -10,7 +10,8 @@ use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 
-const MAX_FILE_SIZE: usize = 512 * 1024;
+// exp/shq: emit/lower.rs carries ~45 extra shader lowerings (ports of upstream PRs #56-#102), so 768 KiB instead of 512 KiB.
+const MAX_FILE_SIZE: usize = 768 * 1024;
 const MAX_ENCODED_RUN: usize = 512;
 
 const ALLOWED_EXTENSIONS: &[&str] = &[
