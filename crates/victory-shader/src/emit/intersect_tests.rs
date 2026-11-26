@@ -242,6 +242,72 @@ fn write_marks_add_the_bitmap_and_leave_no_store_unmarked() {
     }
 }
 
+#[test]
+fn a_marked_program_sets_the_bits_of_the_pages_it_stores_to() {
+    use crate::native::RootType;
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let lowered = build_marks(false, Descriptor::Table, true);
+    assert!(!lowered.marks_incomplete);
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
+        root_indexed_views: Vec::new(),
+        unmarked_writes: false,
+    };
+    // The view the program stores through begins 64 bytes before a page
+    // boundary of title memory (past 4 GiB): its 16 bytes a thread cross it.
+    let base: u64 = 0x1_2345_FFC0;
+    let mut user = vec![0u32; shader.user_data_dwords().max(5) as usize];
+    for u in &shader.user_data {
+        match u.root {
+            RootType::Other(c) if c == super::USER_VIEW_ADDRESS => user[u.index as usize] = base as u32,
+            RootType::Other(c) if c == super::USER_VIEW_ADDRESS + 1 => user[u.index as usize] = (base >> 32) as u32,
+            _ => {}
+        }
+    }
+    let (scene, batches) = scene();
+    let data = buffer(&scene, &batches[0], u64::from(NODES));
+    // The root views follow the user data, by slot then kind (CBV, SRV, UAV).
+    let mut views: Vec<(u8, u8)> = shader.root_cbvs.iter().map(|&r| (r, 0)).collect();
+    views.extend(shader.root_srvs.iter().map(|&r| (r, 1)));
+    views.extend(shader.root_uavs.iter().map(|&r| (r, 2)));
+    views.sort_unstable();
+    let param = 1 + views.iter().position(|&v| v == (super::SLOT_MARKS, 2)).expect("the bitmap") as u32;
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(user.clone())), (param, Root::Uav(super::MARK_PAGES / 32))],
+                    views: &[View::Buffer { data: &data, stride: Stride::Raw }, View::RawUav(4 * THREADS)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        let marks = &out[1];
+        let set: Vec<usize> = (0..marks.len() * 32).filter(|&p| marks[p / 32] >> (p % 32) & 1 != 0).collect();
+        let first = (base >> 16) as usize;
+        let last = ((base + 16 * u64::from(THREADS) - 1) >> 16) as usize;
+        assert_eq!(set, vec![first, last], "{label}: pages marked");
+        ran += 1;
+    }
+    assert!(ran > 0, "no SM 6.6 device available");
+}
+
 /// One thread's test: a node (by its index in the node list), the kind its
 /// pointer carries, and the ray; `None` leaves the thread masked out.
 type Case = Option<(usize, u32, Ray)>;
