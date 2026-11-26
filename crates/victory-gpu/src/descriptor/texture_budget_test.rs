@@ -80,8 +80,7 @@ fn indexed_texture_budget() {
     assert_eq!(create_heap(null(), &desc.0, &HEAP_IIDS[0], &mut heap_object), S_OK);
     let heap = heap(heap_object);
     let host = heap.host().unwrap();
-    let state = State::default();
-    let pass = || state.heap_textures(&device.new_list().unwrap(), heap, host);
+    let pass = || State::heap_textures(crate::draw::Into::List(&device.new_list().unwrap()), heap, host);
 
     let backing = Memory::zeroed(8 * MIB, 64).unwrap();
     let baseline = TextureDesc::rgba8(2048).resource(&backing);

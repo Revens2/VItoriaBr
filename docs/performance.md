@@ -39,6 +39,15 @@ The picture is within the run-to-run variance of `main` (the scene itself is not
 | `VICTORY_REAPER` | on (`0` off) | A thread drops retired D3D12 objects off the submit paths. |
 | `VICTORY_D3D12_GBV=unguarded` | - | Lighter GPU-based validation (diagnostics). |
 
+## Diagnostic and tuning variables documented where they are read
+
+About sixty further `VICTORY_*` names come with the ports (profiler `VICTORY_PROFILE*`, frame log
+`VICTORY_FRAME_LOG`, `VICTORY_CARD_METER*`, `VICTORY_DRIVER_WATCH`, join limits `VICTORY_JOIN_MOST` /
+`VICTORY_JOIN_LISTS`, merge limits `VICTORY_MERGE_RUNS` / `VICTORY_MERGE_GAP`, `VICTORY_QUEUE2_LANDING_MB`,
+`VICTORY_UPLOAD_POOL`, `VICTORY_STAGING_POOL`, `VICTORY_SPREAD*`, `VICTORY_FILL_WAIT`, ...). None is needed
+for the preset; each has its doc comment at the place it is read (`git grep -n '"VICTORY_NAME"' crates`).
+Measured and found without effect, do not set: `VICTORY_MERGE_RUNS=512`; `VICTORY_CARD_HASH_WIDE=0` is slower (12.6 fps).
+
 ## Defaults that changed with the merge
 
 These come from ports of upstream and `fxceless/victory-fork` work (authors kept in the commits,
