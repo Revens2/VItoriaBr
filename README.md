@@ -117,6 +117,8 @@ $env:VICTORY_DISPLAY_MODE = "1920x1080"
 .\target\release\victory.exe run --execute <pasta_do_jogo>\<executavel_do_titulo>
 ```
 
+Interruptores de taxa de quadros (`--console series-s`, ~13,6 fps medidos contra 5,07 do `main` na RTX 5070): [docs/performance.md](docs/performance.md) e [scripts/series-s-preset.ps1](scripts/series-s-preset.ps1).
+
 #### Achados importantes de tuning & diagnóstico
 - **`VICTORY_TEXTURE_NO_WAIT=1`**: elimina stalls de lock na leitura de memória do título durante refresh de texturas (`textures` cai de `900–3.700 ms` para `6–25 ms`).
 - **`VICTORY_DISPLAY_MODE=1920x1080`**: reduz a resolução interna de renderização mesmo em monitores 4K (a janela apenas faz upscale barato no `Present`).
@@ -229,6 +231,8 @@ $env:VICTORY_DISPLAY_MODE = "1920x1080"
 
 .\target\release\victory.exe run --execute <game_dir>\<title_exe>
 ```
+
+Frame-rate switches (`--console series-s`, ~13.6 fps measured against 5.07 for `main` on an RTX 5070): [docs/performance.md](docs/performance.md) and [scripts/series-s-preset.ps1](scripts/series-s-preset.ps1).
 
 > **Tuning notes (RTX 5060 Ti):** Keep `VICTORY_CARD_FETCH_INFLIGHT` off (`0`, default) — enabling it drops `copying back` (`~162 → ~45 ms`) but increases `on the GPU` (`~50–65 → ~200–330 ms`), lowering overall FPS. `VICTORY_BVH_BUILDER=1` reaches `50/53` compute shaders on wave32 (missing 3 `v_readfirstlane_b32` scans: `39321a95223001ed`, `77360df21e12ea43`, `9fc111d3be79364f`); `VICTORY_FIRSTLANE_OWN=1` reaches `53/53` and activates the builder, but corrupts BVH AABB offsets (~18 s crash), so leave it off for now.
 

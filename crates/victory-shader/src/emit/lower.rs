@@ -13546,6 +13546,47 @@ mod tests {
     }
 
     #[test]
+    fn the_24_bit_multiplies_lower_both_halves() {
+        // VOP2 `op v0, v1, v2`: v_mul_i32_i24 and v_mul_u32_u24 (the low
+        // dword) and v_mul_hi_i32_i24 and v_mul_hi_u32_u24 (the high one).
+        for op in [0x09u32, 0x0A, 0x0B, 0x0C] {
+            let word = op << 25 | 2 << 9 | 0x101;
+            lowers_valu(&[word]).unwrap_or_else(|e| panic!("VOP2 {op:#x}: {e}"));
+        }
+    }
+
+    /// The 16-bit multiply-adds `v_mad_u32_u16`, `v_mad_i32_i16`,
+    /// `v_mad_u16` and `v_mad_i16` decode and translate in a program that
+    /// stores the result (the last two clamped too).
+    #[test]
+    fn sixteen_bit_multiply_adds_translate() {
+        for (op, clamps) in [
+            (0x373u32, &[0u32][..]),
+            (0x375, &[0]),
+            (0x340, &[0, 1]),
+            (0x35E, &[0, 1]),
+        ] {
+            for &clamp in clamps {
+                // op v0, v1, v2, v3
+                let words = [0xD400_0000 | op << 16 | clamp << 15, 0x101 | 0x102 << 9 | 0x103 << 18];
+                lowers_valu(&words).unwrap_or_else(|e| panic!("VOP3 {op:#x} clamp {clamp}: {e}"));
+            }
+        }
+    }
+
+    /// `v_cvt_off_f32_i4` decodes (VOP1 and VOP3) and translates in a program
+    /// that stores the result.
+    #[test]
+    fn nibble_offset_conversion_translates() {
+        for body in [
+            [0x7E00_0000 | 0x0E << 9 | 0x101, 0x7E00_0000],
+            [0xD400_0000 | 0x18E << 16, 0x101],
+        ] {
+            lowers_valu(&body).unwrap_or_else(|e| panic!("{body:08x?}: {e}"));
+        }
+    }
+
+    #[test]
     fn a_scalar_carry_chain_reaches_the_select() {
         // The high dword of a 64-bit add or subtract, then a select on the
         // carry (borrow) the high half leaves in SCC, and a branch on it
