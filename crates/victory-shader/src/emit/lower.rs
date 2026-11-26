@@ -35,6 +35,15 @@ mod number_mask;
 #[path = "intersect.rs"]
 pub(super) mod intersect;
 
+/// Write marks (`SLOT_MARKS`).
+#[path = "write_marks.rs"]
+mod write_marks;
+
+/// Buffer formats (the policy limits a file's size).
+#[path = "buffer_format.rs"]
+mod buffer_format_table;
+use buffer_format_table::{Numeric, buffer_format};
+
 type Why = &'static str;
 
 /// How an interpolation evaluates an input channel.
@@ -65,8 +74,7 @@ pub(crate) struct Lowered {
     pub root_cbvs: Vec<u8>,
     pub root_srvs: Vec<u8>,
     pub root_uavs: Vec<u8>,
-    /// Marks were asked for (`shader.rs`, `SLOT_MARKS`) and some buffer
-    /// write could not be marked.
+    /// Marks asked for, a write not markable.
     pub marks_incomplete: bool,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
@@ -100,21 +108,10 @@ enum Stop {
 }
 
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
-    if super::shader::write_marks() {
-        // A write that cannot be marked: the host would have to copy back
-        // everything the shader may write, so it is translated as before.
-        if let Ok(l) = lower_marks(parts, true)
-            && !l.marks_incomplete
-        {
-            return Ok(l);
-        }
-    }
-    let mut l = lower_marks(parts, false)?;
-    l.marks_incomplete = super::shader::write_marks();
-    Ok(l)
+    write_marks::lower(parts)
 }
 
-/// [`lower`], marking the pages the buffer writes touch (`marks`) or not.
+/// [`lower`] with write marks or without.
 pub(crate) fn lower_marks(parts: &Parts, marks: bool) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     loop {
@@ -145,57 +142,6 @@ fn inline_f16(c: u8) -> u32 {
     [
         0x3800, 0xB800, 0x3C00, 0xBC00, 0x4000, 0xC000, 0x4400, 0xC400, 0x3118,
     ][usize::from(c - 240)]
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Numeric {
-    Unorm,
-    Snorm,
-    Uscaled,
-    Sscaled,
-    Uint,
-    Sint,
-    Float,
-}
-
-/// A GFX10 buffer format (the unified format of typed buffer loads): the
-/// channel widths from the lowest bits up, and how the channels convert.
-/// Formats are numbered in families (`8`, `16`, `8_8`, ...: AMD names
-/// list channels from the highest bits), each with its numeric formats in
-/// the order unorm, snorm, uscaled, sscaled, uint, sint, float.
-fn buffer_format(format: u8) -> Option<(&'static [u32], Numeric)> {
-    use Numeric::*;
-    const NORM: &[Numeric] = &[Unorm, Snorm, Uscaled, Sscaled, Uint, Sint];
-    const ALL: &[Numeric] = &[Unorm, Snorm, Uscaled, Sscaled, Uint, Sint, Float];
-    const WIDE: &[Numeric] = &[Uint, Sint, Float];
-    // Numbers and order from LLVM's `UfmtGFX10` (`SIDefines.h`); the GFX10
-    // buffer formats have no 5_9_9_9. Channel order from Mesa
-    // (`ac_formats.c`): R11G11B10_FLOAT is 10_11_11, and 10_10_10_2 has
-    // its 2-bit channel in the lowest bits.
-    const FAMILIES: [(&[u32], &[Numeric]); 14] = [
-        (&[8], NORM),
-        (&[16], ALL),
-        (&[8, 8], NORM),
-        (&[32], WIDE),
-        (&[16, 16], ALL),
-        (&[11, 11, 10], ALL),     // 10_11_11
-        (&[10, 11, 11], ALL),     // 11_11_10
-        (&[2, 10, 10, 10], NORM), // 10_10_10_2
-        (&[10, 10, 10, 2], NORM), // 2_10_10_10
-        (&[8, 8, 8, 8], NORM),
-        (&[32, 32], WIDE),
-        (&[16, 16, 16, 16], ALL),
-        (&[32, 32, 32], WIDE),
-        (&[32, 32, 32, 32], WIDE),
-    ];
-    let mut n = usize::from(format.checked_sub(1)?);
-    for (bits, numerics) in FAMILIES {
-        if n < numerics.len() {
-            return Some((bits, numerics[n]));
-        }
-        n -= numerics.len();
-    }
-    None
 }
 
 /// How far a float channel of `width` bits (16, or the unsigned 11- and
@@ -2830,133 +2776,6 @@ impl<'a> Lower<'a> {
         let lo = self.host_word(RootType::Other(USER_VIEW_ADDRESS), rp.slot, dword);
         let hi = self.host_word(RootType::Other(USER_VIEW_ADDRESS + 1), rp.slot, dword);
         Some((lo, hi))
-    }
-
-    /// `lo`, `hi` plus the byte count `x` (a value), with the carry.
-    fn address_add(&mut self, lo: V, hi: V, x: V) -> (V, V) {
-        let c = self.cur;
-        let i32t = self.s.t.i32;
-        let sum = self.s.m.bin(c, Bin::Add, lo, x);
-        let wrapped = self.s.m.cmp(c, pred::IULT, sum, lo);
-        let one = self.s.m.cast(c, Cast::ZExt, wrapped, i32t);
-        let hi = self.s.m.bin(c, Bin::Add, hi, one);
-        (sum, hi)
-    }
-
-    /// Write marks (`shader.rs`, `SLOT_MARKS`): sets the bits of the pages
-    /// of the title bytes `lo`, `hi` and `lo`, `hi` + `bytes` - 1, each
-    /// only where still clear (most writes find their page marked: a load,
-    /// not an atomic). Call inside the guard of the write it marks.
-    fn mark_pages(&mut self, lo: V, hi: V, bytes: u32) {
-        use super::shader::{MARK_PAGES, SLOT_MARKS};
-        if !self.s.marks {
-            return;
-        }
-        let (last_lo, last_hi) = self.address_plus(lo, hi, (bytes.max(1) - 1) as i32);
-        let i32t = self.s.t.i32;
-        let mut pages = Vec::new();
-        for (lo, hi) in [(lo, hi), (last_lo, last_hi)] {
-            let c = self.cur;
-            let k16 = self.s.m.i32(16);
-            let low = self.s.m.bin(c, Bin::LShr, lo, k16);
-            let k8 = self.s.m.i32(0xFF);
-            let high = self.s.m.bin(c, Bin::And, hi, k8);
-            let high = self.s.m.bin(c, Bin::Shl, high, k16);
-            let page = self.s.m.bin(c, Bin::Or, low, high);
-            // The last bit stands for any address past the bitmap.
-            let last = self.s.m.i32(MARK_PAGES - 1);
-            let page = self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[page, last]);
-            self.s.m.tag(page, Tag::Clamp);
-            pages.push(page);
-        }
-        let bitmap = self.s.root_uav_handle(SLOT_MARKS);
-        for (i, &page) in pages.iter().enumerate() {
-            let c = self.cur;
-            let (k5, k2, k31, one, zero) = (
-                self.s.m.i32(5),
-                self.s.m.i32(2),
-                self.s.m.i32(31),
-                self.s.m.i32(1),
-                self.s.m.i32(0),
-            );
-            let word = self.s.m.bin(c, Bin::LShr, page, k5);
-            let word = self.s.m.bin(c, Bin::Shl, word, k2);
-            let bit = self.s.m.bin(c, Bin::And, page, k31);
-            let bit = self.s.m.bin(c, Bin::Shl, one, bit);
-            let (iu, mask, align) = (self.s.m.undef(i32t), self.s.m.i8(1), self.s.m.i32(4));
-            let old = self.s.op(
-                c,
-                "rawBufferLoad.f32",
-                Attr::ReadOnly,
-                self.s.t.res_ret,
-                139,
-                &[bitmap, word, iu, mask, align],
-            );
-            let old = self.s.m.extract(c, old, 0);
-            let old = self.as_int(old);
-            let seen = self.s.m.bin(c, Bin::And, old, bit);
-            let mut clear = self.s.m.cmp(c, pred::EQ, seen, zero);
-            if i == 1 {
-                // The same page twice: once.
-                let other = self.s.m.cmp(c, pred::NE, page, pages[0]);
-                clear = self.s.m.bin(c, Bin::And, clear, other);
-            }
-            let at = self.begin_guarded(Some(clear));
-            // Operation 2 is OR.
-            self.s.op(
-                self.cur,
-                "atomicBinOp.i32",
-                Attr::NoUnwind,
-                i32t,
-                78,
-                &[bitmap, k2, word, iu, iu, bit],
-            );
-            self.end_guarded(at, &[]);
-        }
-    }
-
-    /// Write marks for `bytes` bytes written at byte `byte` of the view
-    /// the descriptor `src` is: its title address from the host's word (a
-    /// table entry at a fixed place, `USER_VIEW_ADDRESS`), its table by
-    /// heap slot (`SLOT_VIEWS`) or, for a root view, from the host's word.
-    /// A view this cannot name makes the translation incomplete.
-    fn mark_buffer(&mut self, src: &Source, byte: V, bytes: u32) {
-        use super::shader::USER_ROOT_START;
-        if !self.s.marks {
-            return;
-        }
-        let start = match src {
-            // A view in a table at a fixed place: the host's per-draw word
-            // for its address (no pass over the heap's buffers). One the
-            // program picks at run time: the host's table by heap slot.
-            Source::Loaded { load, first } => match (*first == 0).then(|| self.view_address(*load)).flatten() {
-                Some(address) => Some(address),
-                None => match self.heap_index(*load, *first, false) {
-                    Ok(slot) => {
-                        let c = self.cur;
-                        let r = self.s.read_view_slot(c, slot);
-                        let lo = self.s.m.extract(c, r, 0);
-                        let hi = self.s.m.extract(c, r, 1);
-                        Some((self.as_int(lo), self.as_int(hi)))
-                    }
-                    Err(_) => None,
-                },
-            },
-            Source::Built { address, .. } => match self.x.native.layout.get(address.param).copied() {
-                Some(rp) if rp.root == RootType::Descriptor => Some((
-                    self.host_word(RootType::Other(USER_ROOT_START), rp.slot, 0),
-                    self.host_word(RootType::Other(USER_ROOT_START + 1), rp.slot, 0),
-                )),
-                _ => None,
-            },
-            _ => None,
-        };
-        let Some((lo, hi)) = start else {
-            self.s.marks_incomplete = true;
-            return;
-        };
-        let (lo, hi) = self.address_add(lo, hi, byte);
-        self.mark_pages(lo, hi, bytes);
     }
 
     /// [`view_address`] for a table entry chosen at run time (a computed
@@ -10858,8 +10677,7 @@ impl<'a> Lower<'a> {
                 vals = wide;
             }
             let mut args = Vec::new();
-            // Where the write starts in the view, and how many bytes it may
-            // cover (for its marks).
+            // Where the write starts, and its bytes (for its marks).
             let (written, written_bytes);
             let (op, name) = if typed {
                 // shortcut: typed stores are taken to write all four channels
@@ -10870,7 +10688,6 @@ impl<'a> Lower<'a> {
                 args.push(self.handle(site, src, false, (10 | u, 0x409))?);
                 let element = index.unwrap_or(self.s.m.i32(0));
                 args.extend([element, iu]);
-                // The host's typed view has four 32-bit channels.
                 let k16 = self.s.m.i32(16);
                 written = self.s.m.bin(c, Bin::Mul, element, k16);
                 written_bytes = 16;
