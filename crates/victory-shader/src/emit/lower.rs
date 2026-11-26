@@ -6683,15 +6683,80 @@ impl<'a> Lower<'a> {
         x
     }
 
+    /// The bits of the float nearest to `a / d`, `d = 2^w - 1`, for a code
+    /// `0 <= a <= d` and `1 <= w <= 16`, computed in 32-bit integers only so
+    /// that the host's division (not correctly rounded) plays no part.
+    ///
+    /// `a` is scaled by `2^s` into `[2^(w-1), 2^w)`, so that `a' / d` lies in
+    /// `[1/2, 1)`; `Q = floor(a' * 2^32 / d)` comes from two 16-bit long
+    /// division steps (`a' < d < 2^16`), has 32 significant bits and is
+    /// rounded to 24 to nearest even, the remainder serving as sticky bit.
+    /// The result is `m * 2^-24 * 2^-s` with `m` in `[2^23, 2^24]`: adding
+    /// `m - 2^23` to the exponent field takes the carry of `m = 2^24` along.
+    /// Code 0 gives 0 and code `d` gives 1.0.
+    fn norm_quotient(&mut self, a: V, w: u32) -> V {
+        let c = self.cur;
+        let d = (1u32 << w) - 1;
+        let k = |l: &mut Self, v: u32| l.s.m.i32(v);
+        let (zero, one) = (k(self, 0), k(self, 1));
+        let (k16, k23, dv) = (k(self, 16), k(self, 23), k(self, d));
+        // The bit length of the code gives the scale: its float conversion
+        // is exact below 2^24, and the exponent field is 127 + floor(log2).
+        let is_zero = self.s.m.cmp(c, pred::EQ, a, zero);
+        let a1 = self.s.m.select(c, is_zero, one, a);
+        let f = self.s.m.cast(c, Cast::UiToFp, a1, self.s.t.f32);
+        let bits = self.as_int(f);
+        let e = self.s.m.bin(c, Bin::LShr, bits, k23);
+        // s = (w - 1) - floor(log2 a) = (w - 1 + 127) - e.
+        let base = k(self, w - 1 + 127);
+        let s = self.s.m.bin(c, Bin::Sub, base, e);
+        let a_up = self.s.m.bin(c, Bin::Shl, a1, s);
+        // Q = q1 * 2^16 + q2, with the remainders carried.
+        let t1 = self.s.m.bin(c, Bin::Shl, a_up, k16);
+        let q1 = self.s.m.bin(c, Bin::UDiv, t1, dv);
+        let r1 = self.s.m.bin(c, Bin::URem, t1, dv);
+        let t2 = self.s.m.bin(c, Bin::Shl, r1, k16);
+        let q2 = self.s.m.bin(c, Bin::UDiv, t2, dv);
+        let r2 = self.s.m.bin(c, Bin::URem, t2, dv);
+        let hi = self.s.m.bin(c, Bin::Shl, q1, k16);
+        let q = self.s.m.bin(c, Bin::Or, hi, q2);
+        // Round Q to 24 bits (drop 8) to nearest even.
+        let k8 = k(self, 8);
+        let m = self.s.m.bin(c, Bin::LShr, q, k8);
+        let k7 = k(self, 7);
+        let half = self.s.m.bin(c, Bin::LShr, q, k7);
+        let half = self.s.m.bin(c, Bin::And, half, one);
+        let low = k(self, 0x7F);
+        let low = self.s.m.bin(c, Bin::And, q, low);
+        let rest = self.s.m.bin(c, Bin::Or, low, r2);
+        let sticky = self.s.m.cmp(c, pred::NE, rest, zero);
+        let odd = self.s.m.bin(c, Bin::And, m, one);
+        let tie = self.s.m.select(c, sticky, one, odd);
+        let up = self.s.m.bin(c, Bin::And, half, tie);
+        let m = self.s.m.bin(c, Bin::Add, m, up);
+        // Exponent field 126 - s (the value is in [1/2, 1) before the
+        // scale), the fraction m - 2^23.
+        let k126 = k(self, 126);
+        let ex = self.s.m.bin(c, Bin::Sub, k126, s);
+        let ex = self.s.m.bin(c, Bin::Shl, ex, k23);
+        let frac = k(self, 1 << 23);
+        let frac = self.s.m.bin(c, Bin::Sub, m, frac);
+        let out = self.s.m.bin(c, Bin::Add, ex, frac);
+        let one_bits = k(self, 1.0f32.to_bits());
+        let at_top = self.s.m.cmp(c, pred::EQ, a, dv);
+        let out = self.s.m.select(c, at_top, one_bits, out);
+        self.s.m.select(c, is_zero, zero, out)
+    }
+
     /// `channels` channels of the element at byte `off` of raw buffer `h`,
     /// converted from the GFX10 buffer format `format` as the hardware's
     /// typed loads do (channels past the format's read 0, 0, 0, 1).
     // shortcut: the descriptor's channel swizzle is taken as the identity
     // (it is for raw views and the descriptors code builds), elements of 4
-    // bytes or more as dword-aligned. Norm formats divide, which the AMD
-    // driver does 1 ULP off the hardware's correctly rounded conversion for
-    // some values; correct it with an integer check if a title compares
-    // converted values exactly.
+    // bytes or more as dword-aligned. Norm formats of up to 16 bits are
+    // converted by integer arithmetic ([`Self::norm_quotient`]): the host's
+    // float division is 1 ULP off the hardware's correctly rounded
+    // conversion for some codes. Wider ones still divide.
     fn format_load(&mut self, h: V, off: V, format: u8, channels: u32) -> Result<Vec<V>, Why> {
         let (bits, numeric) = buffer_format(format).ok_or("a buffer format")?;
         let c = self.cur;
@@ -6751,19 +6816,40 @@ impl<'a> Lower<'a> {
             let f32t = self.s.t.f32;
             let x = match numeric {
                 Numeric::Unorm => {
-                    let f = self.s.m.cast(c, Cast::UiToFp, field, f32t);
-                    let max = self.s.m.f32((((1u64 << w) - 1) as f32).to_bits());
-                    let q = self.s.m.bin(c, Bin::SDiv, f, max);
-                    float(self, q)
+                    if w <= 16 {
+                        // The nearest float to the exact quotient.
+                        self.norm_quotient(field, w)
+                    } else {
+                        let f = self.s.m.cast(c, Cast::UiToFp, field, f32t);
+                        let max = self.s.m.f32((((1u64 << w) - 1) as f32).to_bits());
+                        let q = self.s.m.bin(c, Bin::SDiv, f, max);
+                        float(self, q)
+                    }
                 }
                 Numeric::Snorm => {
                     let s = signed(self);
-                    let f = self.s.m.cast(c, Cast::SiToFp, s, f32t);
-                    let max = self.s.m.f32((((1u64 << (w - 1)) - 1) as f32).to_bits());
-                    let q = self.s.m.bin(c, Bin::SDiv, f, max);
-                    let lo = self.s.m.f32((-1.0f32).to_bits());
-                    let q = self.binary(35, q, lo);
-                    float(self, q)
+                    if w <= 16 {
+                        // The magnitude's quotient with the sign put back;
+                        // codes at and below -top clamp to -1.0.
+                        let top = (1u32 << (w - 1)) - 1;
+                        let (zero, sign) = (self.s.m.i32(0), self.s.m.i32(0x8000_0000));
+                        let neg = self.s.m.cmp(c, pred::SLT, s, zero);
+                        let minus = self.s.m.bin(c, Bin::Sub, zero, s);
+                        let mag = self.s.m.select(c, neg, minus, s);
+                        let topv = self.s.m.i32(top);
+                        let over = self.s.m.cmp(c, pred::IUGT, mag, topv);
+                        let mag = self.s.m.select(c, over, topv, mag);
+                        let q = self.norm_quotient(mag, w - 1);
+                        let sign = self.s.m.select(c, neg, sign, zero);
+                        self.s.m.bin(c, Bin::Or, q, sign)
+                    } else {
+                        let f = self.s.m.cast(c, Cast::SiToFp, s, f32t);
+                        let max = self.s.m.f32((((1u64 << (w - 1)) - 1) as f32).to_bits());
+                        let q = self.s.m.bin(c, Bin::SDiv, f, max);
+                        let lo = self.s.m.f32((-1.0f32).to_bits());
+                        let q = self.binary(35, q, lo);
+                        float(self, q)
+                    }
                 }
                 Numeric::Uscaled => {
                     let f = self.s.m.cast(c, Cast::UiToFp, field, f32t);
@@ -11383,11 +11469,14 @@ impl<'a> Lower<'a> {
                     let width = self.s.m.extract(c, d, 0);
                     let width = self.s.m.cast(c, Cast::UiToFp, width, self.s.t.f32);
                     let texels = self.s.m.bin(c, Bin::Mul, longer, width);
-                    // log2 = natural logarithm / ln 2; a length of 0 gives
-                    // minus infinity, which the sampler clamps to level 0.
-                    let ln = self.unary(23, texels);
-                    let per_ln2 = self.s.m.f32(std::f32::consts::LOG2_E.to_bits());
-                    let lod = self.s.m.bin(c, Bin::Mul, ln, per_ln2);
+                    // DXIL's Log (op 23) is already base 2, so no scale: the
+                    // former natural-log conversion gave levels 1.44 times too
+                    // high. A length of 0 gives minus infinity, which the
+                    // sampler clamps to level 0. SampleLevel has no clamp
+                    // operand, so the instruction's least level (_cl) is
+                    // applied with a maximum here.
+                    let lod = self.unary(23, texels);
+                    let lod = if has_cl { self.binary(35, lod, clamp) } else { lod };
                     args.extend(&os);
                     args.push(lod);
                     self.s.op(

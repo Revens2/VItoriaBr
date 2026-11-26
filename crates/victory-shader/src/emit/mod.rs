@@ -85,6 +85,8 @@ mod container;
 #[cfg(test)]
 mod coverage_tests;
 #[cfg(all(test, windows))]
+mod cube_lod_tests;
+#[cfg(all(test, windows))]
 mod diff_tests;
 #[cfg(all(test, windows))]
 mod intersect_tests;
