@@ -594,7 +594,24 @@ impl Layout {
         row_pitch: usize,
         depth_pitch: usize,
     ) -> Result<(), Error> {
-        self.walk::<true>(tiled, linear, mip, slice, row_pitch, depth_pitch)
+        self.walk::<true>(tiled, linear, mip, slice, None, row_pitch, depth_pitch)
+    }
+
+    /// Rows `rows` of what [`Layout::detile`] writes, for a subresource one
+    /// depth slice deep (2D textures and array slices): `linear` begins with
+    /// row `rows.start`. The bytes written are those `detile` writes there,
+    /// so parts of a subresource can be detiled at once on several threads
+    /// (from FernandoHaeser/ztrx perf/30fps 7c17018, re-written on `walk`).
+    pub fn detile_rows(
+        &self,
+        tiled: &[u8],
+        mip: u32,
+        slice: u32,
+        rows: std::ops::Range<u32>,
+        linear: &mut [u8],
+        row_pitch: usize,
+    ) -> Result<(), Error> {
+        self.walk::<true>(tiled, linear, mip, slice, Some(rows), row_pitch, 0)
     }
 
     /// The reverse of [`Layout::detile`]: linear rows into tiled memory.
@@ -607,7 +624,7 @@ impl Layout {
         row_pitch: usize,
         depth_pitch: usize,
     ) -> Result<(), Error> {
-        self.walk::<false>(linear, tiled, mip, slice, row_pitch, depth_pitch)
+        self.walk::<false>(linear, tiled, mip, slice, None, row_pitch, depth_pitch)
     }
 
     /// Copies contiguous runs in one direction between the two layouts.
@@ -618,11 +635,17 @@ impl Layout {
         dst: &mut [u8],
         mip: u32,
         slice: u32,
+        rows: Option<std::ops::Range<u32>>,
         row_pitch: usize,
         depth_pitch: usize,
     ) -> Result<(), Error> {
         let m = self.mips.get(mip as usize).ok_or(Error::Invalid)?;
         let depth = m.depth;
+        let rows = rows.unwrap_or(0..m.height);
+        if rows.start >= rows.end || rows.end > m.height || (depth != 1 && rows != (0..m.height)) {
+            return Err(Error::Invalid);
+        }
+        let nrows = (rows.end - rows.start) as usize;
         let first = if self.desc.dimension == Dimension::Tex3d {
             if slice != 0 {
                 return Err(Error::Invalid);
@@ -641,7 +664,7 @@ impl Layout {
         let bytes = m.width as usize * n;
         let need = (depth as usize - 1)
             .checked_mul(depth_pitch)
-            .zip((m.height as usize - 1).checked_mul(row_pitch))
+            .zip((nrows - 1).checked_mul(row_pitch))
             .and_then(|(depth_offset, row_offset)| depth_offset.checked_add(row_offset))
             .and_then(|offset| offset.checked_add(bytes))
             .ok_or(Error::TooSmall)?;
@@ -681,8 +704,8 @@ impl Layout {
         for z in 0..depth {
             let (s, inner) = self.split(first + z);
             let base = u64::from(s) * self.slice_size + m.offset;
-            for y in 0..m.height {
-                let linear_row = z as usize * depth_pitch + y as usize * row_pitch;
+            for y in rows.clone() {
+                let linear_row = z as usize * depth_pitch + (y - rows.start) as usize * row_pitch;
                 if linear {
                     let tiled_row = base + u64::from(y) * u64::from(m.pitch) * n as u64;
                     copy_run::<DETILE>(src, dst, tiled_row as usize, linear_row, bytes);

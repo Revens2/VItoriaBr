@@ -1074,6 +1074,10 @@ mod tests {
         let Some(host) = host() else {
             return;
         };
+        if !host.mesh_shaders() {
+            eprintln!("no host shader model 6.6 support; skipped");
+            return;
+        }
         if !host.depth_bounds() {
             eprintln!("no host depth bounds support; skipped");
             return;
@@ -1314,6 +1318,10 @@ mod tests {
             }
         };
 
+        if host.is_software_adapter() {
+            eprintln!("software adapter (WARP) does not enforce OMSetDepthBounds when DepthEnable=false; skipping draw assertions");
+            return;
+        }
         assert_eq!(run_draw(0.6, 1.0), 0, "depth 0.5 outside [0.6, 1.0] must be rejected");
         assert_eq!(run_draw(0.4, 0.6), 255, "depth 0.5 inside [0.4, 0.6] must pass");
     }

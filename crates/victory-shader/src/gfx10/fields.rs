@@ -235,19 +235,32 @@ impl Instruction {
             }
             Encoding::Sopp => Fields::Sopp { imm: w0 as u16 },
             Encoding::Smem => {
-                let data = match name {
-                    "s_gl1_inv" | "s_dcache_inv" | "s_dcache_wb" => None,
-                    n if n.starts_with("s_dcache_discard") => None,
-                    "s_memtime" | "s_memrealtime" => Some(2),
-                    _ => Some(data_dwords(name)),
+                let sdata = (w0 >> 6 & 0x7F) as u8;
+                // s_atc_probe*: SDATA is a 7-bit immediate, not an SGPR. The
+                // buffer form's resource is 4 dwords. GLC and DLC are not operands.
+                let probe = matches!(name, "s_atc_probe" | "s_atc_probe_buffer");
+                let data = if probe {
+                    Some(Operand::Literal(u32::from(sdata)))
+                } else {
+                    match name {
+                        "s_gl1_inv" | "s_dcache_inv" | "s_dcache_wb" => None,
+                        n if n.starts_with("s_dcache_discard") => None,
+                        "s_memtime" | "s_memrealtime" => Some(scalar(sdata, 2)),
+                        _ => Some(scalar(sdata, data_dwords(name))),
+                    }
                 };
-                let base = 2 + 2 * u8::from(name.starts_with("s_buffer_"));
+                let base =
+                    2 + 2 * u8::from(name.starts_with("s_buffer_") || name == "s_atc_probe_buffer");
                 Fields::Smem {
-                    data: data.map(|d| scalar((w0 >> 6 & 0x7F) as u8, d)),
+                    data,
                     base: scalar(((w0 & 0x3F) << 1) as u8, base),
                     offset: (w1 << 11) as i32 >> 11,
                     soffset: scalar((w1 >> 25) as u8, 1),
-                    cache: cache(bit(w0, 16), false, bit(w0, 14)),
+                    cache: if probe {
+                        Cache::default()
+                    } else {
+                        cache(bit(w0, 16), false, bit(w0, 14))
+                    },
                 }
             }
             Encoding::Vop1 | Encoding::Vop2 | Encoding::Vopc | Encoding::Vop3 | Encoding::Vop3p => {
@@ -566,6 +579,9 @@ impl Instruction {
                                 chan: (code >> 6 & 3) as u8,
                                 high: code >> 8 & 1 == 1,
                             }
+                        } else if i == 1 && name == "v_interp_mov_f32" {
+                            // The parameter (p10, p20, p0), as in VINTRP.
+                            Operand::Const((code & 3) as u8)
                         } else if i == 2 && carry_in {
                             source(code, lanes, w(2))
                         } else {
@@ -635,6 +651,9 @@ const VOP3_TWO_SOURCES: &[&str] = &[
     "v_cvt_pknorm_u16_f16",
     "v_lshlrev_b16",
     "v_interp_p1ll_f16",
+    "v_interp_p1_f32",
+    "v_interp_p2_f32",
+    "v_interp_mov_f32",
     "v_readlane_b32",
     "v_writelane_b32",
     "v_ldexp_f32",

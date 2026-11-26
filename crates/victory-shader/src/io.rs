@@ -26,10 +26,10 @@
 //! index from the wave index (s3 bits 24-27) and the lane (`v_mbcnt`), and
 //! its group id from v5 of the first lane (`v_readfirstlane`: the group
 //! times the group size). Lane n exports vertex n (`exp pos`, `exp param`)
-//! and primitive n (`exp prim`: 10-bit vertex indices at bits 0, 10, 20,
-//! bit 31 culls); `param` entries with bit 7 are per-primitive outputs. One
-//! lane sends the output counts (`s_sendmsg` GS_ALLOC_REQ, m0 = vertices |
-//! primitives << 12).
+//! and primitive n (`exp prim`: 9-bit vertex indices at bits 0, 10, 20,
+//! each with an edge flag above it, bit 31 culls); `param` entries with
+//! bit 7 are per-primitive outputs. One lane sends the output counts
+//! (`s_sendmsg` GS_ALLOC_REQ, m0 = vertices | primitives << 12).
 
 use crate::ShaderError;
 use crate::gfx10::{Fields, Operand};
@@ -753,6 +753,22 @@ mod tests {
         // attr1 is not in the stage data.
         let other = program(&[0xC808_0400, S_ENDPGM]); // v_interp_p1_f32 v2, v0, attr1.x
         assert!(raise(&other, &pixel(vec![TEXCOORD], 2)).is_err());
+    }
+
+    /// The VOP3 (64-bit) encodings of v_interp_p1_f32 and v_interp_p2_f32
+    /// decode, but only the VINTRP pair is understood: they are refused.
+    #[test]
+    fn vop3_encoded_f32_interpolation_is_refused() {
+        let p = program(&[
+            0xD600_0002, // v_interp_p1_f32_e64 v2, v0, attr0.x
+            0x0202_0000,
+            0xD601_0002, // v_interp_p2_f32_e64 v2, v1, attr0.x
+            0x0202_0200,
+            S_ENDPGM,
+        ]);
+        let names: Vec<_> = p.blocks[0].insts.iter().map(|i| i.name()).collect();
+        assert_eq!(names, ["v_interp_p1_f32", "v_interp_p2_f32", "s_endpgm"]);
+        assert!(raise(&p, &pixel(vec![TEXCOORD], 2)).is_err());
     }
 
     #[test]
