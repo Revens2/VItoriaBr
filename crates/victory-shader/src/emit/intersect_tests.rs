@@ -188,12 +188,58 @@ fn build(
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
         root_indexed_views: res.root_indexed_views.clone(),
+        unmarked_writes: false,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = shader.dxil.clone();
         v.validate(&mut copy).expect("DXIL validation failed");
     }
     Ok((shader, res))
+}
+
+/// The program lowered with write marks (or without), validated when the
+/// validator is there.
+fn build_marks(wide: bool, descriptor: Descriptor, marks: bool) -> lower::Lowered {
+    let native = native(&program(wide, descriptor));
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("tracked");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let lowered = lower::lower_marks(
+        &lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+        },
+        marks,
+    )
+    .expect("lowers");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = lowered.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    lowered
+}
+
+#[test]
+fn write_marks_add_the_bitmap_and_leave_no_store_unmarked() {
+    // The program stores through a descriptor of the view heap: with marks
+    // the shader binds the bitmap and asks the host for the view's address;
+    // without, nothing of that.
+    for wide in [true, false] {
+        let plain = build_marks(wide, Descriptor::Table, false);
+        assert!(!plain.root_uavs.contains(&super::SLOT_MARKS));
+        let marked = build_marks(wide, Descriptor::Table, true);
+        assert!(!marked.marks_incomplete, "a store the translator could not mark");
+        assert!(marked.root_uavs.contains(&super::SLOT_MARKS));
+        assert!(marked.dxil.len() > plain.dxil.len());
+    }
 }
 
 /// One thread's test: a node (by its index in the node list), the kind its

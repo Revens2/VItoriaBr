@@ -2364,6 +2364,9 @@ struct Deferred {
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
+    /// Write marks (`crate::marks`): the list's bitmap and whether some
+    /// draw of it may store without marks.
+    marks: crate::marks::ListMarks,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
@@ -3817,6 +3820,8 @@ fn relay_hand_back(back: &[Declared]) {
         }
         let mut spans: Vec<(usize, usize)> = Vec::new();
         join_ranges(&mut spans, declared.iter().copied());
+        // With write marks: only the pages shaders marked.
+        let spans: Vec<(usize, usize)> = spans.into_iter().flat_map(|(from, to)| shadow.marked_runs(from, to)).collect();
         for &(from, to) in &spans {
             shadow.relay_compared(from, to - from);
         }
@@ -4088,7 +4093,41 @@ fn continues(last: (usize, usize, usize), next: (usize, usize, usize)) -> bool {
 /// The ranges the shaders of `runs` may write, per host copy, as declared.
 /// One list's lock at a time: a submission may name a list twice.
 fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
-    declared_where(runs, |_| true)
+    let back = declared_where(runs, |_| true);
+    note_marks(runs, &back);
+    back
+}
+
+/// With write marks: tells each copy of `back` what the submission
+/// declared of it and which bitmaps tell what its lists' shaders wrote.
+/// Dropped when the copy's ranges are done with ([`Shadow::copy_back_done`]).
+fn note_marks(runs: &[&HostList], back: &[Declared]) {
+    if !crate::marks::on() {
+        return;
+    }
+    type ByCopy = std::collections::HashMap<usize, Vec<(usize, usize)>>;
+    let mut lists: Vec<(Option<std::sync::Arc<crate::marks::MarkBuf>>, ByCopy)> = Vec::new();
+    for list in runs {
+        let known = list.deferred().marks.known();
+        let mut by = ByCopy::new();
+        for step in &list.deferred().copies {
+            if let Step::GpuWrite(shadow, address, len) = step {
+                by.entry(std::sync::Arc::as_ptr(shadow) as usize).or_default().push((*address, *address + *len));
+            }
+        }
+        lists.push((known, by));
+    }
+    for (shadow, ranges) in back {
+        if shadow.carded() {
+            continue;
+        }
+        let key = std::sync::Arc::as_ptr(shadow) as usize;
+        let entry = crate::marks::Entry {
+            ranges: ranges.clone(),
+            lists: lists.iter().filter_map(|(buf, by)| by.get(&key).map(|r| (r.clone(), buf.clone()))).collect(),
+        };
+        shadow.note_marks(entry);
+    }
 }
 
 /// [`declared_writes`] of the host copies `which` takes.
@@ -4213,7 +4252,9 @@ fn hand_back(back: &[Declared]) {
                     _ => spans.push((from, to)),
                 }
             }
-            work.extend(spans.into_iter().map(|(from, to)| (shadow.clone(), from, to)));
+            // With write marks: only the pages shaders marked.
+            let spans = spans.into_iter().flat_map(|(from, to)| shadow.marked_runs(from, to));
+            work.extend(spans.map(|(from, to)| (shadow.clone(), from, to)));
         }
         #[cfg(feature = "diagnostics")]
         let scanning = std::time::Instant::now();
@@ -4252,6 +4293,8 @@ fn hand_back(back: &[Declared]) {
                 _ => spans.push((from, to)),
             }
         }
+        // With write marks: only the pages shaders marked.
+        let spans: Vec<(usize, usize)> = spans.into_iter().flat_map(|(from, to)| shadow.marked_runs(from, to)).collect();
         for (from, to) in spans {
             let written = shadow.copy_back(from, to - from);
             copy_back(1, written as u64);
@@ -7345,6 +7388,31 @@ impl HostList {
 
     fn deferred(&self) -> std::sync::MutexGuard<'_, Deferred> {
         self.deferred.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A draw of the list has shaders that mark the pages they write: the
+    /// list takes a bitmap if it has none. False if none could be made
+    /// (the list is unmarked then).
+    pub(crate) fn marks_use(&self) -> bool {
+        let mut d = self.deferred();
+        if d.marks.buf.is_none() {
+            d.marks.buf = crate::marks::MarkBuf::take();
+        }
+        if d.marks.buf.is_none() {
+            d.marks.broken = true;
+        }
+        d.marks.buf.is_some()
+    }
+
+    /// A draw of the list may store to buffers and its shader cannot mark
+    /// the pages: all the ranges the list declares are copied back.
+    pub(crate) fn marks_break(&self) {
+        self.deferred().marks.broken = true;
+    }
+
+    /// The GPU address of the list's bitmap of marked pages.
+    pub(crate) fn marks_gpu(&self) -> Option<u64> {
+        self.deferred().marks.buf.as_ref().map(|b| b.gpu)
     }
 
     /// Copies `len` bytes from `src` to `dst` when the list is submitted.

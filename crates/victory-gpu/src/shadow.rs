@@ -85,6 +85,10 @@ pub(crate) struct Shadow {
     card: Option<Card>,
     /// A window of title memory outside buffers, not a title buffer's copy.
     window: bool,
+    /// With write marks (`crate::marks`): what each submission not yet
+    /// done with declared of this copy, oldest first, and which pages
+    /// its lists' shaders marked.
+    marks: Mutex<Vec<crate::marks::Entry>>,
     /// With `crate::inplace`: not a copy at all. `buffer` is placed in a
     /// heap opened on the title memory itself, so shaders read and write
     /// the title's own bytes and nothing is copied either way. The heap,
@@ -3134,8 +3138,27 @@ impl Shadow {
             },
             card: None,
             window: false,
+            marks: Mutex::default(),
             place: None,
         }
+    }
+
+    /// A submission declared `ranges` of this copy (what its `back` holds:
+    /// each once); `lists` are, per list, the ranges it declared and its
+    /// bitmap (none: unmarked).
+    pub(crate) fn note_marks(&self, entry: crate::marks::Entry) {
+        self.marks.lock().unwrap_or_else(|e| e.into_inner()).push(entry);
+    }
+
+    /// The runs of `[from, to)` (title addresses) the copy-back must
+    /// compare: the pages marked, as far as the submissions not done with
+    /// say; all of it if none is known.
+    pub(crate) fn marked_runs(&self, from: usize, to: usize) -> Vec<(usize, usize)> {
+        if !crate::marks::on() {
+            return vec![(from, to)];
+        }
+        let entries = self.marks.lock().unwrap_or_else(|e| e.into_inner());
+        crate::marks::marked_runs(&entries, from, to)
     }
 
     /// `[address, address + len)` cut to the buffer, as offsets in the copy.
@@ -3593,6 +3616,20 @@ impl Shadow {
     pub(crate) fn copy_back_done(&self, ranges: &[(usize, usize)]) {
         if self.place.is_some() {
             return;
+        }
+        // The submission's marks: the oldest entry with these ranges (they
+        // are done with in the order they were sent).
+        {
+            let mut marks = self.marks.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(at) = marks.iter().position(|e| e.ranges == ranges) {
+                let entry = marks.remove(at);
+                drop(marks);
+                for (_, buf) in entry.lists {
+                    if let Some(buf) = buf {
+                        crate::marks::give_back(buf);
+                    }
+                }
+            }
         }
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         if relay() {

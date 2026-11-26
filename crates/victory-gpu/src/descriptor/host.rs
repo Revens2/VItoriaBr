@@ -859,6 +859,8 @@ pub(crate) fn probe_view_limit() {
             "host view heaps hold {views} views; view indices are clamped to the null slot at the end from the first shader on"
         );
         victory_shader::emit::set_view_heap_limit(views - 1);
+        // Write marks change the translation too: told before the first.
+        let _ = crate::marks::on();
     });
 }
 

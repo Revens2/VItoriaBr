@@ -998,6 +998,17 @@ impl State {
                 _ => 0,
             };
         }
+        if kind == victory_shader::emit::USER_ROOT_START || kind == victory_shader::emit::USER_ROOT_START + 1 {
+            // Write marks: the title address the root view's raw host view
+            // begins at.
+            let start = match self.roots_ref(compute).get(usize::from(slot)) {
+                Some(&Root::View(address)) => {
+                    address - u64::from(self.host_word(compute, USER_VIEW_BIAS, slot, 0, None))
+                }
+                _ => 0,
+            };
+            return if kind == victory_shader::emit::USER_ROOT_START { start as u32 } else { (start >> 32) as u32 };
+        }
         if kind != USER_VIEW_ADDRESS && kind != USER_VIEW_ADDRESS + 1 {
             once!(kind, "a shader reads a host value this build does not know");
             return 0;
@@ -1210,6 +1221,17 @@ impl State {
                 // whose clamps were hoisted (`crate::indirect::hoisting`).
                 list.count_write();
             }
+            // Write marks: this list's shaders mark what they write, or
+            // (one that may store and cannot) the list's ranges all count.
+            if crate::marks::on() {
+                if t.host.root_uavs.contains(&victory_shader::emit::SLOT_MARKS) {
+                    if !list.marks_use() {
+                        once!("write marks: no bitmap for the list; its ranges are all copied back");
+                    }
+                } else if t.host.unmarked_writes {
+                    list.marks_break();
+                }
+            }
             STORES.set(t.stores);
             let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
             STORES.set(true);
@@ -1353,6 +1375,22 @@ impl State {
                 }
             }
             for &(slot, param) in &stage.root_uavs {
+                if slot == victory_shader::emit::SLOT_MARKS {
+                    // Ours: the list's bitmap of the pages shaders write.
+                    let Some(gpu) = list.marks_gpu() else {
+                        return false;
+                    };
+                    // SAFETY: an open list; the bitmap lives as long as the
+                    // list holds it.
+                    unsafe {
+                        if compute {
+                            l.SetComputeRootUnorderedAccessView(param, gpu);
+                        } else {
+                            l.SetGraphicsRootUnorderedAccessView(param, gpu);
+                        }
+                    }
+                    continue;
+                }
                 if slot == victory_shader::emit::SLOT_FAULTS {
                     // Ours: where shaders note the pages they found empty.
                     if let Some(m) = &memory {

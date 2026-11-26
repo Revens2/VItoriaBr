@@ -115,8 +115,8 @@ pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
     SLOT_STRIDES_COUNT, SLOT_VIEW_BYTES, SLOT_VIEWS, SLOT_VIEWS_COUNT, USER_DATA_SPACE,
-    USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
-    set_view_heap_limit, view_heap_limit,
+    USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS, MARK_BYTES, MARK_PAGES, SLOT_MARKS, USER_ROOT_START,
+    set_view_heap_limit, view_heap_limit, set_write_marks, write_marks,
 };
 
 /// The loop limit without an override: 4096.
@@ -204,6 +204,7 @@ pub fn translation_fingerprint() -> Vec<u8> {
     }
     out.extend_from_slice(&lower::host_max_wave().to_le_bytes());
     out.extend_from_slice(&shader::view_heap_limit().to_le_bytes());
+    out.push(u8::from(shader::write_marks()));
     out.extend_from_slice(&loop_limit().to_le_bytes());
     out.push(group_sync());
     out.extend_from_slice(&shader_opt().to_le_bytes());
@@ -261,6 +262,10 @@ pub struct HostShader {
     pub root_uavs: Vec<u8>,
     /// Heap descriptors that can be selected from root state at bind time.
     pub root_indexed_views: Vec<crate::resource::RootIndexedView>,
+    /// Write marks were asked for ([`set_write_marks`]) and some store of
+    /// the shader to a buffer could not be marked: the host cannot know
+    /// which pages it wrote and copies back all it may write.
+    pub unmarked_writes: bool,
 }
 
 impl HostShader {
@@ -703,6 +708,7 @@ fn emit_program(
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
         root_indexed_views: res.root_indexed_views.clone(),
+        unmarked_writes: l.marks_incomplete,
     };
     Ok((shader, wave_size))
 }
@@ -1101,6 +1107,7 @@ mod tests {
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
             root_indexed_views: Vec::new(),
+            unmarked_writes: false,
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -1113,6 +1120,7 @@ mod tests {
                 root_srvs: Vec::new(),
                 root_uavs: Vec::new(),
                 root_indexed_views: Vec::new(),
+                unmarked_writes: false,
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);
@@ -1404,6 +1412,7 @@ mod tests {
                 root_srvs: l.root_srvs,
                 root_uavs: l.root_uavs,
                 root_indexed_views: Vec::new(),
+                unmarked_writes: false,
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
             let inputs: Vec<u32> = [

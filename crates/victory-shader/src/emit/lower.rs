@@ -65,6 +65,9 @@ pub(crate) struct Lowered {
     pub root_cbvs: Vec<u8>,
     pub root_srvs: Vec<u8>,
     pub root_uavs: Vec<u8>,
+    /// Marks were asked for (`shader.rs`, `SLOT_MARKS`) and some buffer
+    /// write could not be marked.
+    pub marks_incomplete: bool,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
     /// The wave size the shader requires of the host, if any.
@@ -97,9 +100,27 @@ enum Stop {
 }
 
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
+    if super::shader::write_marks() {
+        // A write that cannot be marked: the host would have to copy back
+        // everything the shader may write, so it is translated as before.
+        if let Ok(l) = lower_marks(parts, true)
+            && !l.marks_incomplete
+        {
+            return Ok(l);
+        }
+    }
+    let mut l = lower_marks(parts, false)?;
+    l.marks_incomplete = super::shader::write_marks();
+    Ok(l)
+}
+
+/// [`lower`], marking the pages the buffer writes touch (`marks`) or not.
+pub(crate) fn lower_marks(parts: &Parts, marks: bool) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     loop {
-        match Lower::new(parts, &bad).run() {
+        let mut lowering = Lower::new(parts, &bad);
+        lowering.s.marks = marks;
+        match lowering.run() {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
@@ -2319,12 +2340,14 @@ impl<'a> Lower<'a> {
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
         let cmp_samplers = self.s.cmp_samplers;
         let wave_size = self.s.wave_size;
+        let marks_incomplete = self.s.marks_incomplete;
         Ok(Lowered {
             wave_size,
             cmp_samplers,
             root_cbvs,
             root_srvs,
             root_uavs,
+            marks_incomplete,
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
@@ -2809,6 +2832,133 @@ impl<'a> Lower<'a> {
         Some((lo, hi))
     }
 
+    /// `lo`, `hi` plus the byte count `x` (a value), with the carry.
+    fn address_add(&mut self, lo: V, hi: V, x: V) -> (V, V) {
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        let sum = self.s.m.bin(c, Bin::Add, lo, x);
+        let wrapped = self.s.m.cmp(c, pred::IULT, sum, lo);
+        let one = self.s.m.cast(c, Cast::ZExt, wrapped, i32t);
+        let hi = self.s.m.bin(c, Bin::Add, hi, one);
+        (sum, hi)
+    }
+
+    /// Write marks (`shader.rs`, `SLOT_MARKS`): sets the bits of the pages
+    /// of the title bytes `lo`, `hi` and `lo`, `hi` + `bytes` - 1, each
+    /// only where still clear (most writes find their page marked: a load,
+    /// not an atomic). Call inside the guard of the write it marks.
+    fn mark_pages(&mut self, lo: V, hi: V, bytes: u32) {
+        use super::shader::{MARK_PAGES, SLOT_MARKS};
+        if !self.s.marks {
+            return;
+        }
+        let (last_lo, last_hi) = self.address_plus(lo, hi, (bytes.max(1) - 1) as i32);
+        let i32t = self.s.t.i32;
+        let mut pages = Vec::new();
+        for (lo, hi) in [(lo, hi), (last_lo, last_hi)] {
+            let c = self.cur;
+            let k16 = self.s.m.i32(16);
+            let low = self.s.m.bin(c, Bin::LShr, lo, k16);
+            let k8 = self.s.m.i32(0xFF);
+            let high = self.s.m.bin(c, Bin::And, hi, k8);
+            let high = self.s.m.bin(c, Bin::Shl, high, k16);
+            let page = self.s.m.bin(c, Bin::Or, low, high);
+            // The last bit stands for any address past the bitmap.
+            let last = self.s.m.i32(MARK_PAGES - 1);
+            let page = self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[page, last]);
+            self.s.m.tag(page, Tag::Clamp);
+            pages.push(page);
+        }
+        let bitmap = self.s.root_uav_handle(SLOT_MARKS);
+        for (i, &page) in pages.iter().enumerate() {
+            let c = self.cur;
+            let (k5, k2, k31, one, zero) = (
+                self.s.m.i32(5),
+                self.s.m.i32(2),
+                self.s.m.i32(31),
+                self.s.m.i32(1),
+                self.s.m.i32(0),
+            );
+            let word = self.s.m.bin(c, Bin::LShr, page, k5);
+            let word = self.s.m.bin(c, Bin::Shl, word, k2);
+            let bit = self.s.m.bin(c, Bin::And, page, k31);
+            let bit = self.s.m.bin(c, Bin::Shl, one, bit);
+            let (iu, mask, align) = (self.s.m.undef(i32t), self.s.m.i8(1), self.s.m.i32(4));
+            let old = self.s.op(
+                c,
+                "rawBufferLoad.f32",
+                Attr::ReadOnly,
+                self.s.t.res_ret,
+                139,
+                &[bitmap, word, iu, mask, align],
+            );
+            let old = self.s.m.extract(c, old, 0);
+            let old = self.as_int(old);
+            let seen = self.s.m.bin(c, Bin::And, old, bit);
+            let mut clear = self.s.m.cmp(c, pred::EQ, seen, zero);
+            if i == 1 {
+                // The same page twice: once.
+                let other = self.s.m.cmp(c, pred::NE, page, pages[0]);
+                clear = self.s.m.bin(c, Bin::And, clear, other);
+            }
+            let at = self.begin_guarded(Some(clear));
+            // Operation 2 is OR.
+            self.s.op(
+                self.cur,
+                "atomicBinOp.i32",
+                Attr::NoUnwind,
+                i32t,
+                78,
+                &[bitmap, k2, word, iu, iu, bit],
+            );
+            self.end_guarded(at, &[]);
+        }
+    }
+
+    /// Write marks for `bytes` bytes written at byte `byte` of the view
+    /// the descriptor `src` is: its title address from the host's word (a
+    /// table entry at a fixed place, `USER_VIEW_ADDRESS`), its table by
+    /// heap slot (`SLOT_VIEWS`) or, for a root view, from the host's word.
+    /// A view this cannot name makes the translation incomplete.
+    fn mark_buffer(&mut self, src: &Source, byte: V, bytes: u32) {
+        use super::shader::USER_ROOT_START;
+        if !self.s.marks {
+            return;
+        }
+        let start = match src {
+            // A view in a table at a fixed place: the host's per-draw word
+            // for its address (no pass over the heap's buffers). One the
+            // program picks at run time: the host's table by heap slot.
+            Source::Loaded { load, first } => match (*first == 0).then(|| self.view_address(*load)).flatten() {
+                Some(address) => Some(address),
+                None => match self.heap_index(*load, *first, false) {
+                    Ok(slot) => {
+                        let c = self.cur;
+                        let r = self.s.read_view_slot(c, slot);
+                        let lo = self.s.m.extract(c, r, 0);
+                        let hi = self.s.m.extract(c, r, 1);
+                        Some((self.as_int(lo), self.as_int(hi)))
+                    }
+                    Err(_) => None,
+                },
+            },
+            Source::Built { address, .. } => match self.x.native.layout.get(address.param).copied() {
+                Some(rp) if rp.root == RootType::Descriptor => Some((
+                    self.host_word(RootType::Other(USER_ROOT_START), rp.slot, 0),
+                    self.host_word(RootType::Other(USER_ROOT_START + 1), rp.slot, 0),
+                )),
+                _ => None,
+            },
+            _ => None,
+        };
+        let Some((lo, hi)) = start else {
+            self.s.marks_incomplete = true;
+            return;
+        };
+        let (lo, hi) = self.address_add(lo, hi, byte);
+        self.mark_pages(lo, hi, bytes);
+    }
+
     /// [`view_address`] for a table entry chosen at run time (a computed
     /// index into a descriptor table or the resource heap): the host's table
     /// of the buffer views' title addresses by heap slot
@@ -3012,6 +3162,7 @@ impl<'a> Lower<'a> {
             let at = self.begin_guarded(guard);
             self.s
                 .op(self.cur, "rawBufferStore.i32", Attr::NoUnwind, void, 140, &args);
+            self.mark_pages(lo, hi, 4 * u32::from(n));
             self.end_guarded(at, &[]);
             return Ok(());
         }
@@ -3116,6 +3267,7 @@ impl<'a> Lower<'a> {
                 found
             }
         };
+        self.mark_pages(lo, hi, 4);
         let was = self.end_guarded(at, &[(was, old)])[0];
         if let Some(reg) = back {
             self.write(inst, Reg::V(reg), was, None);
@@ -10620,17 +10772,18 @@ impl<'a> Lower<'a> {
                 }
                 self.end_guarded(second, &[]);
             }
+            self.mark_buffer(src, aligned, 8);
             self.end_guarded(at, &[]);
             return Ok(());
         }
         if let Some(op) = atomic {
             let d = data.as_ref().ok_or("buffer atomic data")?;
             let vals = self.vgprs(inst, d, if op == u32::MAX { 2 } else { 1 })?;
-            let (h, coords) = match index {
+            let (h, coords, written) = match index {
                 // A raw buffer (stride 1) read by index: the index is the byte.
                 Some(index) if used.is_some_and(|u| u.stride == 1) => {
                     let byte = self.s.m.bin(c, Bin::Add, index, off);
-                    (self.handle(site, src, false, (11 | u, 0))?, [byte, iu, iu])
+                    (self.handle(site, src, false, (11 | u, 0))?, [byte, iu, iu], byte)
                 }
                 Some(index) => {
                     let stride = used.map_or(0, |u| u.stride);
@@ -10638,9 +10791,12 @@ impl<'a> Lower<'a> {
                         return Err("a structured buffer of unknown stride");
                     }
                     let h = self.handle(site, src, false, (12 | u, stride))?;
-                    (h, [index, off, iu])
+                    let k = self.s.m.i32(stride);
+                    let row = self.s.m.bin(c, Bin::Mul, index, k);
+                    let byte = self.s.m.bin(c, Bin::Add, row, off);
+                    (h, [index, off, iu], byte)
                 }
-                None => (self.handle(site, src, false, (11 | u, 0))?, [off, iu, iu]),
+                None => (self.handle(site, src, false, (11 | u, 0))?, [off, iu, iu], off),
             };
             let Operand::Vector { reg, .. } = *d else {
                 return Err("buffer atomic data");
@@ -10672,6 +10828,7 @@ impl<'a> Lower<'a> {
                 self.s
                     .op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args)
             };
+            self.mark_buffer(src, written, 4);
             let r = self.end_guarded(at, &[(r, old)])[0];
             if returns {
                 self.write(inst, Reg::V(reg), r, None);
@@ -10701,6 +10858,9 @@ impl<'a> Lower<'a> {
                 vals = wide;
             }
             let mut args = Vec::new();
+            // Where the write starts in the view, and how many bytes it may
+            // cover (for its marks).
+            let (written, written_bytes);
             let (op, name) = if typed {
                 // shortcut: typed stores are taken to write all four channels
                 // of a float format.
@@ -10708,7 +10868,12 @@ impl<'a> Lower<'a> {
                     return Err("a typed buffer store of some channels or at an offset");
                 }
                 args.push(self.handle(site, src, false, (10 | u, 0x409))?);
-                args.extend([index.unwrap_or(self.s.m.i32(0)), iu]);
+                let element = index.unwrap_or(self.s.m.i32(0));
+                args.extend([element, iu]);
+                // The host's typed view has four 32-bit channels.
+                let k16 = self.s.m.i32(16);
+                written = self.s.m.bin(c, Bin::Mul, element, k16);
+                written_bytes = 16;
                 for x in vals {
                     args.push(self.as_float(x));
                 }
@@ -10720,6 +10885,7 @@ impl<'a> Lower<'a> {
                         let byte = self.s.m.bin(c, Bin::Add, index, off);
                         args.push(self.handle(site, src, false, (11 | u, 0))?);
                         args.extend([byte, iu]);
+                        (written, written_bytes) = (byte, 4 * count);
                     }
                     Some(index) => {
                         let stride = used.map_or(0, |u| u.stride);
@@ -10728,10 +10894,14 @@ impl<'a> Lower<'a> {
                         }
                         args.push(self.handle(site, src, false, (12 | u, stride))?);
                         args.extend([index, off]);
+                        let k = self.s.m.i32(stride);
+                        let row = self.s.m.bin(c, Bin::Mul, index, k);
+                        (written, written_bytes) = (self.s.m.bin(c, Bin::Add, row, off), 4 * count);
                     }
                     None => {
                         args.push(self.handle(site, src, false, (11 | u, 0))?);
                         args.extend([off, iu]);
+                        (written, written_bytes) = (off, 4 * count);
                     }
                 }
                 args.extend(&vals);
@@ -10745,6 +10915,7 @@ impl<'a> Lower<'a> {
             let at = self.begin_guarded(guard);
             let void = self.s.t.void;
             self.s.op(self.cur, name, Attr::NoUnwind, void, op, &args);
+            self.mark_buffer(src, written, written_bytes);
             self.end_guarded(at, &[]);
             return Ok(());
         }

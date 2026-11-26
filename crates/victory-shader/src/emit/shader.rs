@@ -83,6 +83,39 @@ pub const USER_VIEW_ADDRESS: u32 = 0x101;
 /// a spilled user-data table.
 pub const USER_VIEW_BIAS: u32 = 0x103;
 
+/// The root UAV `u<SLOT_MARKS>` in [`ROOT_CBV_SPACE`] of a shader translated
+/// with write marks ([`set_write_marks`]): a raw bitmap of [`MARK_PAGES`]
+/// bits, one per 64 KiB page of title address space. Every store and atomic
+/// the shader makes to a buffer (through a view of the heap, a root view or
+/// a raw address) sets the bit of the page of its first and of its last
+/// byte, so the host copies back only pages some shader wrote. The bits
+/// are only ever set by shaders; the host clears them between submissions.
+pub const SLOT_MARKS: u8 = 251;
+/// Bits of the [`SLOT_MARKS`] bitmap: title addresses below 128 GiB (a page
+/// past it marks the last bit, which stands for none).
+pub const MARK_PAGES: u32 = 1 << 21;
+/// Bytes of the [`SLOT_MARKS`] bitmap.
+pub const MARK_BYTES: u32 = MARK_PAGES / 8;
+/// `RootType::Other` code of a user-data dword the host computes: the
+/// low 32 bits of the title address a root view's raw host view begins at
+/// (the root view's address less [`USER_VIEW_BIAS`] bytes); +1: bits 32 up.
+/// Only asked for to mark writes through root UAVs.
+pub const USER_ROOT_START: u32 = 0x104;
+
+static WRITE_MARKS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether shaders translated now mark the pages they write
+/// ([`SLOT_MARKS`]). The translation depends on it: the shader cache keys
+/// on it (`translation_fingerprint`).
+pub fn set_write_marks(on: bool) {
+    WRITE_MARKS.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// See [`set_write_marks`].
+pub fn write_marks() -> bool {
+    WRITE_MARKS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
     pub const RAW_BUFFERS: u64 = 1 << 4;
@@ -167,6 +200,11 @@ pub(crate) struct Shader {
     pub root_srvs: Vec<(u8, V)>,
     /// Root UAVs (raw buffers) read or written, likewise.
     pub root_uavs: Vec<(u8, V)>,
+    /// Write marks: this translation marks the pages its buffer writes
+    /// touch, and whether some write could not be marked (the translation
+    /// is then made again without marks).
+    pub marks: bool,
+    pub marks_incomplete: bool,
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
@@ -224,6 +262,8 @@ impl Shader {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
+            marks: false,
+            marks_incomplete: false,
             flags: 0,
             nonuniform_handles: 0,
             threads: None,
@@ -1056,6 +1096,7 @@ mod tests {
             root_cbvs: Vec::new(),
             root_uavs: Vec::new(),
             root_indexed_views: Vec::new(),
+            unmarked_writes: false,
         };
         let data = [0x1020_3040, 0x100, 320, 20, 0x5060_7080, 0x200, 768, 24];
         let (root, pipeline) = host.compute_pipeline(&shader).expect("view table pipeline");
